@@ -33,6 +33,11 @@ def _kaiacord_only(exc: BaseException) -> str | None:
             path = ROOT.joinpath(*mod.split("."))
             if not path.with_suffix(".py").exists() and not (path / "__init__.py").exists():
                 return mod
+        # a test that reads a Kaiacord source file this project does not carry
+        if isinstance(exc, FileNotFoundError) and exc.filename:
+            rel = str(exc.filename)
+            if rel.split("/")[0] in ("utils", "tools") and not (ROOT / rel).exists():
+                return rel
         exc = exc.__cause__ or exc.__context__
     return None
 
