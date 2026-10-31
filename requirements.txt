@@ -1,0 +1,13 @@
+# KaiaBooth — install into a venv:  python3 -m venv venv && venv/bin/pip install -r requirements.txt
+# Pinned to the versions Kaiacord runs (31 Oct 2026).
+numpy==2.4.1
+scipy==1.17.1
+aiohttp==3.13.3
+pyyaml==6.0.3
+# Tests
+pytest
+pytest-asyncio
+# System: ffmpeg built with librubberband (the stretch and key shift), and an audio
+# player: pw-cat (PipeWire), paplay, aplay or ffplay. Optional: Essentia under the system
+# Python for onset ticks (tools/maintenance/beat_ticks.py); without it grids come from
+# the catalog's BPM and the audio alone.

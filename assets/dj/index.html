@@ -1,0 +1,2066 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KAIA // Booth</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=JetBrains+Mono:wght@400;600;800&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #04060c; --panel: #0a0e19; --panel2: #0d1322; --line: #18223a;
+  --cyan: #00f0ff; --pink: #ff2fd1; --green: #3dff8a; --yellow: #ffe45c; --red: #ff3860;
+  --purple: #a259ff; --blue: #2f7bff; --text: #d6e2ff; --dim: #5d6b8f; --faint: #2a3554;
+  --d1: var(--cyan); --d2: var(--pink);
+  --mono: "JetBrains Mono", ui-monospace, "DejaVu Sans Mono", monospace;
+  --disp: "Orbitron", "JetBrains Mono", sans-serif;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font-family: var(--mono); overflow: hidden; }
+body::before { /* the grid floor */
+  content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+  background-image: linear-gradient(rgba(0,240,255,.035) 1px, transparent 1px), linear-gradient(90deg, rgba(0,240,255,.035) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+body::after { /* scanlines */
+  content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 50;
+  background: repeating-linear-gradient(0deg, rgba(0,0,0,.18) 0 1px, transparent 1px 3px); mix-blend-mode: multiply;
+}
+/* ── FX: the stage behind the decks and the feedback in front of them ── */
+#fxbg { position: fixed; inset: 0; z-index: 0; pointer-events: none; display: none; }
+#fxtop { position: fixed; inset: 0; z-index: 45; pointer-events: none; display: none; }
+body.fx #fxbg, body.fx #fxtop { display: block; }
+body.fx::before { opacity: .35; }
+body.fx .panel { background: linear-gradient(180deg, rgba(13,19,34,.62), rgba(10,14,25,.72)); }
+body.fx #app { padding: 18px 26px 22px; gap: 16px; }
+body.fx #bottom, body.fx #mid { gap: 16px; }
+body.fx.shake #app { animation: fxshake .28s linear; }
+@keyframes fxshake { 0%,100% { transform: none } 20% { transform: translate(-5px, 2px) } 40% { transform: translate(4px, -3px) }
+  60% { transform: translate(-3px, -1px) } 80% { transform: translate(3px, 2px) } }
+#fxbtn { cursor: pointer; user-select: none; }
+#fxbtn.on b { color: var(--pink); text-shadow: 0 0 8px var(--pink); }
+#app { position: relative; z-index: 1; display: grid; height: 100%; padding: 10px 12px 12px; gap: 10px;
+  grid-template-rows: 44px minmax(130px, 19vh) 1fr minmax(210px, 28vh); }
+
+/* ── header ── */
+header { display: flex; align-items: center; gap: 18px; padding: 0 6px; }
+.logo { font-family: var(--disp); font-weight: 900; font-size: 22px; letter-spacing: 4px; color: var(--cyan);
+  text-shadow: 0 0 8px rgba(0,240,255,.8), 2px 0 0 rgba(255,47,209,.7), -2px 0 0 rgba(61,255,138,.35); }
+.logo span { color: var(--pink); text-shadow: 0 0 8px rgba(255,47,209,.9); }
+.pill { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: 3px; padding: 4px 10px;
+  font-size: 12px; color: var(--dim); letter-spacing: 1px; background: rgba(10,14,25,.7); white-space: nowrap; }
+.pill b { color: var(--text); font-weight: 600; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); }
+.dot.live { background: var(--red); box-shadow: 0 0 10px var(--red); animation: pulse 1.2s infinite; }
+.spacer { flex: 1; }
+#clock { font-family: var(--disp); font-size: 18px; color: var(--green); text-shadow: 0 0 8px rgba(61,255,138,.6); letter-spacing: 2px; }
+@keyframes pulse { 50% { opacity: .35; } }
+@keyframes blink { 50% { opacity: .15; } }
+
+/* ── panels ── */
+.panel { position: relative; background: linear-gradient(180deg, var(--panel2), var(--panel)); border: 1px solid var(--line);
+  border-radius: 4px; box-shadow: inset 0 0 40px rgba(0,0,0,.6), 0 0 0 1px rgba(0,0,0,.5); overflow: hidden; }
+.panel::before, .panel::after { content: ""; position: absolute; width: 14px; height: 14px; border-color: var(--accent, var(--cyan)); opacity: .8; }
+.panel::before { top: -1px; left: -1px; border-top: 2px solid; border-left: 2px solid; }
+.panel::after { bottom: -1px; right: -1px; border-bottom: 2px solid; border-right: 2px solid; }
+.ptitle { position: absolute; top: 6px; left: 12px; font-family: var(--disp); font-size: 10px; letter-spacing: 3px; color: var(--dim); z-index: 2; }
+
+#lanes { width: 100%; height: 100%; display: block; }
+
+#mid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(340px, 26%) minmax(0, 1fr); gap: 10px; min-height: 0; }
+/* No label may widen its column: a long NEXT button or status line pushed the
+   mixer past its share and the panel clipped its right half. */
+#mid > *, .mixer > *, .strips > *, .btns > *, .fx > *, #bottom > * { min-width: 0; }
+.fx .row, .fx .count, .fx .why, .blendsel { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#skip, #auto { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+body.turning, body.turning * { cursor: ns-resize !important; user-select: none; }
+.deck { --accent: var(--dc); display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto auto; gap: clamp(4px, 0.7vh, 8px); padding: 10px 14px 10px; min-height: 0; overflow: hidden; }
+.deck[data-slot="1"] { --dc: var(--d1); --dcg: rgba(0,240,255,.55); }
+.deck[data-slot="2"] { --dc: var(--d2); --dcg: rgba(255,47,209,.55); }
+.dtop { display: flex; align-items: center; gap: 8px; flex-wrap: nowrap; min-width: 0; overflow: hidden; }
+.dnum { font-family: var(--disp); font-weight: 900; font-size: 26px; color: var(--dc); text-shadow: 0 0 12px var(--dcg); width: 34px; }
+.badge { font-size: 10px; letter-spacing: 1.5px; padding: 3px 7px; border-radius: 2px; border: 1px solid var(--faint); color: var(--dim); font-weight: 600; }
+.badge.on { color: #021014; background: var(--bc, var(--dc)); border-color: var(--bc, var(--dc)); box-shadow: 0 0 10px var(--bc, var(--dc)); }
+.badge.blink { animation: blink .8s infinite; }
+.state { margin-left: auto; font-family: var(--disp); font-size: 12px; letter-spacing: 3px; white-space: nowrap; flex-shrink: 0; }
+.dtitle { min-width: 0; }
+.dtitle .t { font-size: 19px; font-weight: 800; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-shadow: 0 0 10px rgba(255,255,255,.15); }
+.dtitle .a { font-size: 13px; color: var(--dc); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
+.dtitle .g { font-size: 11px; color: var(--dim); margin-top: 2px; letter-spacing: 1px; }
+.dbody { display: grid; grid-template-columns: auto 1fr; gap: 14px; min-height: 0; align-items: center; }
+.jogwrap { position: relative; height: 100%; aspect-ratio: 1; max-height: 250px; min-height: 140px; }
+.jog { width: 100%; height: 100%; display: block; }
+.readouts { display: grid; grid-template-columns: 1fr 1fr; gap: clamp(4px, 0.6vh, 8px); align-content: center; min-height: 0; }
+.ro { background: rgba(0,0,0,.35); border: 1px solid var(--line); border-radius: 3px; padding: clamp(3px, 0.5vh, 6px) 9px; }
+.ro .k { font-size: 9px; letter-spacing: 2px; color: var(--dim); }
+.ro .v { font-family: var(--disp); font-size: clamp(16px, 2.5vh, 26px); font-weight: 700; color: var(--text); line-height: 1.15; }
+.ro .v small { font-size: 12px; color: var(--dim); font-family: var(--mono); font-weight: 400; margin-left: 4px; }
+.ro.big .v { font-size: clamp(22px, 3.3vh, 34px); color: var(--dc); text-shadow: 0 0 12px var(--dcg); }
+.ro.warn .v { color: var(--red); animation: blink .6s infinite; }
+.beats { display: flex; gap: 5px; margin-top: 5px; }
+.beats i { flex: 1; height: 7px; border-radius: 1px; background: var(--faint); }
+.beats i.on { background: var(--dc); box-shadow: 0 0 8px var(--dc); }
+.beats i.on.one { background: var(--yellow); box-shadow: 0 0 8px var(--yellow); }
+.ov { width: 100%; height: clamp(34px, 5vh, 54px); display: block; border: 1px solid var(--line); border-radius: 3px; background: rgba(0,0,0,.4); }
+.phase { width: 0; min-width: 0; height: 14px; display: block; }
+.transport { display: flex; gap: 8px; align-items: center; }
+.btn { font-family: var(--disp); font-size: 12px; letter-spacing: 2px; color: var(--dim); background: rgba(0,0,0,.4);
+  border: 1px solid var(--faint); border-radius: 50px; padding: 8px 16px; min-width: 70px; text-align: center; user-select: none; }
+.btn.lit { color: #031; border-color: var(--green); background: var(--green); box-shadow: 0 0 14px rgba(61,255,138,.7); }
+.btn.cue.lit { background: var(--yellow); border-color: var(--yellow); box-shadow: 0 0 14px rgba(255,228,92,.7); color: #221; }
+.btn.cue.blink { animation: blink .5s infinite; }
+.meta { font-size: 11px; color: var(--dim); margin-left: auto; text-align: right; line-height: 1.5; }
+.meta b { color: var(--text); font-weight: 600; }
+
+/* ── mixer ── */
+.mixer { --accent: var(--green); padding: 24px 12px 10px; display: grid; grid-template-rows: minmax(0, 1fr) auto auto auto; gap: 8px; min-height: 0; overflow: hidden; }
+.strips { display: grid; grid-template-columns: 1fr 64px 1fr; gap: 8px; min-height: 0; overflow: hidden; }
+.strip { display: grid; grid-template-columns: 54px 1fr; grid-template-rows: auto 1fr; gap: 6px 10px; min-height: 0; }
+.strip .ch { grid-column: 1 / span 2; text-align: center; font-family: var(--disp); font-weight: 900; font-size: 15px; }
+.knobs { display: flex; flex-direction: column; justify-content: space-between; gap: 4px; min-height: 0; }
+.knob { text-align: center; font-size: 8px; letter-spacing: 1.5px; color: var(--dim); line-height: 1.1; position: relative; }
+/* Kaia's own hand on a knob: a badge over the canvas, so no column grows. */
+.kbadge { position: absolute; top: -3px; right: -6px; font-size: 7px; letter-spacing: 0; padding: 0 2px; border-radius: 3px;
+          color: #0b0f1a; background: var(--pink); box-shadow: 0 0 8px var(--pink); opacity: 0; transition: opacity .15s; pointer-events: none; white-space: nowrap; font-style: normal; }
+.kbadge.on { opacity: 1; }
+.knob.herhand { color: var(--pink); }
+.knob canvas { width: clamp(20px, 2.5vh, 36px); height: clamp(20px, 2.5vh, 36px); display: block; margin: 0 auto 1px; }
+.fadebox { display: flex; gap: 8px; align-items: stretch; justify-content: center; height: 100%; min-height: 0; }
+.vu, .fader { width: 14px; height: 100%; display: block; }
+.fader { width: 26px; }
+.mastercol { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; justify-items: center; gap: 4px; min-height: 0; }
+.mk { display: flex; gap: 4px; }
+.mastercol .lbl { font-size: 9px; letter-spacing: 2px; color: var(--dim); }
+.mvu { display: flex; gap: 4px; height: 100%; min-height: 0; }
+#xf { width: 100%; height: 28px; display: block; }
+.xlabels { display: flex; justify-content: space-between; font-size: 9px; letter-spacing: 2px; color: var(--dim); margin-top: -4px; }
+.fx { border: 1px solid var(--line); border-radius: 3px; padding: 5px 10px; background: rgba(0,0,0,.35); }
+.fx .row { display: flex; align-items: baseline; gap: 10px; }
+.fx .kind { font-family: var(--disp); font-weight: 900; font-size: 18px; letter-spacing: 3px; color: var(--dim); }
+.fx .kind.blend { color: var(--green); text-shadow: 0 0 12px rgba(61,255,138,.7); }
+.fx .kind.cut { color: var(--yellow); text-shadow: 0 0 12px rgba(255,228,92,.7); }
+.fx .kind.echo { color: var(--purple); text-shadow: 0 0 12px rgba(162,89,255,.7); }
+.fx .kind.fade { color: var(--purple); text-shadow: 0 0 12px rgba(162,89,255,.7); }
+.fx .kind.plan { color: var(--cyan); animation: blink .8s infinite; }
+.fx .count { margin-left: auto; font-size: 12px; color: var(--text); letter-spacing: 1px; }
+.fx .why { font-size: 11px; color: var(--dim); margin-top: 3px; min-height: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#prog { width: 100%; height: 14px; display: block; margin-top: 4px; }
+#skip { width: 100%; font-family: var(--disp); font-weight: 700; font-size: 13px; letter-spacing: 4px; padding: 8px; cursor: pointer;
+  color: var(--pink); background: rgba(255,47,209,.07); border: 1px solid var(--pink); border-radius: 3px;
+  box-shadow: 0 0 14px rgba(255,47,209,.35), inset 0 0 14px rgba(255,47,209,.15); transition: all .15s; }
+#skip:hover:not(:disabled) { background: rgba(255,47,209,.2); box-shadow: 0 0 22px rgba(255,47,209,.7), inset 0 0 18px rgba(255,47,209,.3); color: #fff; }
+#skip:disabled { color: var(--faint); border-color: var(--faint); box-shadow: none; cursor: default; background: transparent; }
+
+/* ── bottom ── */
+#bottom { display: grid; grid-template-columns: 1.25fr 1fr 0.9fr; gap: 10px; min-height: 0; }
+.list { padding: 26px 12px 10px; overflow: hidden; }
+.list ol { margin: 0; padding: 0; list-style: none; font-size: 12px; height: 100%; overflow: hidden; display: flex; flex-direction: column-reverse; justify-content: flex-end; }
+.list li { display: flex; gap: 10px; padding: 3px 0; border-bottom: 1px dashed var(--line); color: var(--dim); white-space: nowrap; }
+.list li .n { width: 26px; color: var(--faint); }
+.list li .nm { overflow: hidden; text-overflow: ellipsis; flex: 1; }
+.list li.now { color: #fff; }
+.list li.now .n { color: var(--green); }
+.tk { font-size: 9px; letter-spacing: 1.5px; padding: 1px 6px; border-radius: 2px; border: 1px solid; }
+.tk.blend { color: var(--green); border-color: var(--green); }
+.tk.cut { color: var(--yellow); border-color: var(--yellow); }
+.tk.echo { color: var(--purple); border-color: var(--purple); }
+.tk.fade { color: var(--purple); border-color: var(--purple); }
+.tk.hand, .tk.out { color: var(--pink); border-color: var(--pink); }
+.next { --accent: var(--purple); padding: 26px 14px 12px; display: grid; grid-template-rows: auto auto 1fr; gap: 6px; }
+.next .t { font-size: 17px; font-weight: 800; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.next .a { font-size: 13px; color: var(--purple); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; align-content: flex-start; margin-top: 4px; }
+.chip { font-size: 11px; padding: 4px 8px; border: 1px solid var(--faint); border-radius: 2px; color: var(--text); }
+.chip i { font-style: normal; color: var(--dim); margin-right: 5px; font-size: 9px; letter-spacing: 1.5px; }
+.chip.good { border-color: var(--green); } .chip.ok { border-color: var(--yellow); } .chip.bad { border-color: var(--red); }
+/* Kaia on the decks: her codec avatar fills the panel. What she says is the
+   codec subtitle (fixed height: a box sized by its text grew and squeezed the
+   row); her decision feed and the mood readings sit behind LOG. */
+.kaia { --accent: var(--pink); padding: 0; min-height: 0; background: #010402; }
+#kaia-stage { position: absolute; inset: 0; }
+.kaia-codec-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.kaia-codec-fallback { width: 100%; height: 100%; object-fit: contain; object-position: center bottom;
+  filter: grayscale(1) sepia(1) hue-rotate(75deg) saturate(3) brightness(.85) contrast(1.2); }
+.kaia .ptitle { position: absolute; top: 8px; left: 12px; z-index: 3; }
+.kaia .ears { position: absolute; top: 8px; right: 70px; z-index: 3; max-width: 55%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: right; }
+#kaialog { position: absolute; top: 5px; right: 8px; z-index: 4; font-family: var(--disp); font-size: 9px; letter-spacing: 2px; color: var(--dim);
+  border: 1px solid var(--faint); border-radius: 2px; padding: 3px 7px; cursor: pointer; background: rgba(4,6,12,.75); user-select: none; }
+#kaialog.on { color: var(--pink); border-color: var(--pink); }
+.kaia .say { position: absolute; left: 0; right: 0; bottom: 0; z-index: 3; height: 62px; padding: 16px 12px 8px; border-left: none;
+  background: linear-gradient(transparent, rgba(0,6,2,.9) 30%); color: #c8ffd9; text-shadow: 0 0 6px rgba(61,255,138,.55);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.kaia .say::before { content: "KAIA"; color: var(--green); font-weight: 700; margin-right: 6px; }
+#kaiadetail { position: absolute; inset: 26px 8px 66px 8px; z-index: 3; display: none; grid-template-rows: auto minmax(0, 1fr); gap: 8px;
+  padding: 8px 10px; background: rgba(4,6,12,.86); border: 1px solid var(--line); border-radius: 3px; }
+#kaiadetail.on { display: grid; }
+/* What she says about the set: newest at the bottom, older lines fading. */
+.feed { min-height: 0; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; gap: 5px;
+  font-size: 11px; line-height: 1.4; mask-image: linear-gradient(to bottom, transparent, #000 35%); }
+.feed .ln { display: grid; grid-template-columns: 38px 1fr; gap: 6px; color: var(--text); }
+.feed .ln b { color: var(--dim); font-weight: 400; font-size: 9px; letter-spacing: 1px; padding-top: 2px; }
+.feed .ln.pick span { color: var(--cyan); } .feed .ln.plan span { color: var(--green); }
+.feed .ln.switch span { color: var(--yellow); } .feed .ln.set span { color: var(--purple); }
+.feed .ln.hands span, .feed .ln.hand span { color: var(--pink); } .feed .ln.bad span { color: var(--red); }
+.feed .ln.fresh span { text-shadow: 0 0 8px currentColor; }
+.mood { display: grid; grid-template-columns: 70px 1fr 38px; gap: 6px 8px; align-items: center; font-size: 10px; letter-spacing: 1.5px; color: var(--dim); }
+.bar { height: 8px; background: var(--faint); border-radius: 1px; overflow: hidden; }
+.bar i { display: block; height: 100%; width: 0; transition: width .6s; }
+.mood .val { color: var(--text); text-align: right; }
+.say { font-size: 12px; color: var(--text); line-height: 1.45; border-left: 2px solid var(--pink); padding-left: 9px; }
+.ears { font-size: 11px; color: var(--dim); }
+
+/* ── hands on ── */
+.knob canvas, #mknob { cursor: grab; touch-action: none; }
+.knob canvas:active, #mknob:active { cursor: grabbing; }
+.fader, #xf { cursor: pointer; touch-action: none; }
+.blendsel { display: flex; align-items: center; gap: 6px; font-size: 9px; letter-spacing: 2px; color: var(--dim); margin-bottom: 4px; }
+.blendsel span { cursor: pointer; padding: 2px 8px; border: 1px solid var(--faint); border-radius: 2px; user-select: none; }
+.blendsel span:hover { border-color: var(--cyan); color: var(--text); }
+.blendsel span.on { color: #031; background: var(--cyan); border-color: var(--cyan); box-shadow: 0 0 8px rgba(0,240,255,.5); }
+.blendsel em { font-style: normal; margin-left: auto; color: var(--dim); }
+#rides.on { color: #031; background: var(--pink); border-color: var(--pink); box-shadow: 0 0 8px rgba(255,47,209,.5); }
+.knob.touched { color: var(--yellow); }
+.btn.play { cursor: pointer; }
+.btn.paused { color: #221; background: var(--red); border-color: var(--red); box-shadow: 0 0 14px rgba(255,56,96,.7); animation: blink 1s infinite; }
+.btns { display: grid; grid-template-columns: 1fr auto; gap: 4px 8px; }
+#skiphint { grid-column: 1 / -1; font-size: 10px; letter-spacing: .5px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+#auto { font-family: var(--disp); font-weight: 700; font-size: 11px; letter-spacing: 2px; padding: 0 14px; cursor: pointer;
+  color: var(--green); background: rgba(61,255,138,.06); border: 1px solid var(--green); border-radius: 3px; }
+#auto.hot { background: var(--green); color: #031; box-shadow: 0 0 14px rgba(61,255,138,.6); }
+#mknob, #phknob { width: clamp(20px, 2.6vh, 30px); height: clamp(20px, 2.6vh, 30px); display: block; margin: 0 auto 1px; }
+#toast { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%); z-index: 60; background: rgba(10,14,25,.95);
+  border: 1px solid var(--cyan); color: var(--text); padding: 9px 18px; border-radius: 3px; font-size: 12px; letter-spacing: 1px;
+  box-shadow: 0 0 18px rgba(0,240,255,.35); opacity: 0; transition: opacity .25s; pointer-events: none; }
+#toast.show { opacity: 1; }
+/* ── crate ── */
+.crate { --accent: var(--green); display: grid; grid-template-rows: auto auto 1fr; padding: 8px 10px 8px; min-height: 0; }
+.tabs { display: flex; gap: 4px; align-items: center; }
+.tab { font-family: var(--disp); font-size: 10px; letter-spacing: 3px; color: var(--dim); padding: 4px 10px; border: 1px solid transparent; border-radius: 2px; cursor: pointer; user-select: none; }
+.tab.on { color: var(--green); border-color: var(--green); box-shadow: 0 0 8px rgba(61,255,138,.35); }
+.tabs .count { margin-left: auto; font-size: 10px; color: var(--dim); letter-spacing: 1px; }
+#search { margin: 6px 0; width: 100%; background: rgba(0,0,0,.45); border: 1px solid var(--line); border-radius: 2px; color: var(--text);
+  font-family: var(--mono); font-size: 12px; padding: 5px 8px; outline: none; }
+#search:focus { border-color: var(--cyan); box-shadow: 0 0 8px rgba(0,240,255,.3); }
+.scroll { overflow-y: auto; min-height: 0; padding-right: 4px; }
+.scroll::-webkit-scrollbar { width: 8px; }
+.scroll::-webkit-scrollbar-track { background: rgba(0,0,0,.35); }
+.scroll::-webkit-scrollbar-thumb { background: linear-gradient(var(--cyan), var(--pink)); border-radius: 4px; }
+.genre { margin-bottom: 4px; }
+.genre > .gh { display: flex; align-items: center; gap: 8px; font-size: 10px; letter-spacing: 2px; color: var(--purple); padding: 4px 2px;
+  cursor: pointer; user-select: none; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--panel); z-index: 1; }
+.genre > .gh .n { color: var(--dim); margin-left: auto; }
+.genre.shut .rows { display: none; }
+.trk { display: grid; grid-template-columns: 1fr 52px 38px 58px; gap: 6px; align-items: center; font-size: 12px; padding: 3px 4px; cursor: pointer; border-radius: 2px; }
+.trk:hover { background: rgba(0,240,255,.08); }
+.trk .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.trk .nm i { font-style: normal; color: var(--dim); }
+.trk .bpm { color: var(--dim); text-align: right; font-size: 11px; }
+.trk .key { font-size: 10px; text-align: center; border-radius: 2px; padding: 1px 0; color: #04060c; font-weight: 700; }
+.trk .st { font-size: 9px; letter-spacing: 1px; text-align: right; color: var(--dim); }
+.trk.played .nm { color: var(--dim); }
+.trk.req .st { color: var(--yellow); }
+.trk.now { background: rgba(61,255,138,.1); } .trk.now .st { color: var(--green); }
+#setpane, #setspane { display: none; }
+#mdelay { margin-left: 10px; font-size: 8px; letter-spacing: 1px; color: var(--dim); border: 1px solid var(--faint); border-radius: 2px; padding: 0 5px; cursor: pointer; user-select: none; }
+#mdelay:hover { color: var(--text); border-color: var(--cyan); }
+.mset .gh .tag { font-size: 8px; letter-spacing: 1.5px; padding: 1px 5px; border-radius: 2px; }
+.mset .gh .tag.now { color: #04060c; background: var(--green); box-shadow: 0 0 8px rgba(61,255,138,.5); }
+.mset .gh .tag.up { color: var(--yellow); border: 1px solid var(--yellow); }
+.mset .gh .meta { color: var(--dim); letter-spacing: 1px; font-size: 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.mset .gh .play { margin-left: auto; flex: none; font-size: 9px; letter-spacing: 1.5px; color: var(--cyan); border: 1px solid var(--cyan);
+  border-radius: 2px; padding: 1px 8px; cursor: pointer; }
+.mset .gh .play:hover { background: var(--cyan); color: #04060c; }
+.mset.playing > .gh { color: var(--green); }
+.mset .trk .pos { color: var(--dim); font-size: 10px; margin-right: 6px; }
+.trk .bpm.fit { font-weight: 700; font-size: 10px; letter-spacing: .5px; }
+.trk.loaded { background: rgba(255,47,209,.10); } .trk.loaded .st { color: var(--pink); }
+#collapse { font-size: 9px; letter-spacing: 1.5px; color: var(--dim); border: 1px solid var(--faint); border-radius: 2px; padding: 2px 7px; cursor: pointer; user-select: none; margin-left: 8px; }
+#collapse:hover { color: var(--text); border-color: var(--cyan); }
+.btn.cue, .btn.ph { cursor: pointer; }
+.btn.ph { min-width: 54px; padding: 8px 10px; }
+.btn.ph.lit { color: #031; background: var(--cyan); border-color: var(--cyan); box-shadow: 0 0 14px rgba(0,240,255,.7); }
+.btn.off { opacity: .35; cursor: default; }
+.ov.scrub, .jog.scrub { cursor: ew-resize; }
+.jog.scrub { cursor: grab; }
+#phknob { cursor: grab; touch-action: none; }
+
+/* ── idle ── */
+#idle { position: fixed; inset: 0; z-index: 20; display: none; place-items: center; background: radial-gradient(circle at 50% 40%, rgba(0,240,255,.06), transparent 60%), var(--bg); }
+#idle.show { display: grid; }
+#idle .big { font-family: var(--disp); font-weight: 900; font-size: 64px; letter-spacing: 12px; color: var(--cyan); text-align: center;
+  text-shadow: 0 0 22px rgba(0,240,255,.8), 4px 0 0 rgba(255,47,209,.6); }
+#idle .sub { text-align: center; color: var(--dim); letter-spacing: 3px; margin-top: 18px; font-size: 14px; }
+#idle .sub b { color: var(--pink); }
+
+/* ── responsive layouts ────────────────────────────────────────────
+   The default is the full desktop booth. Below these breakpoints the
+   panels reflow instead of letting the fixed-height grid clip controls.
+*/
+@media (max-width: 1280px) {
+  #app { padding: 8px; gap: 8px; grid-template-rows: 40px minmax(130px, 18vh) 1fr minmax(200px, 26vh); }
+  #mid { grid-template-columns: minmax(0, 1fr) minmax(290px, 30%) minmax(0, 1fr); gap: 8px; }
+  #bottom { grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr) minmax(0, .9fr); gap: 8px; }
+  header { gap: 10px; }
+  .logo { font-size: 19px; letter-spacing: 3px; }
+  .pill { padding: 4px 7px; font-size: 10px; }
+  .deck { padding: 8px; }
+  .dtop { gap: 5px; }
+  .dnum { width: 28px; font-size: 22px; }
+  .state { font-size: 10px; letter-spacing: 1px; }
+  .dtitle .t { font-size: clamp(13px, 1.4vw, 18px); }
+  .dbody { grid-template-columns: minmax(0, 38%) minmax(0, 1fr); gap: 8px; }
+  .jogwrap { min-height: 0; max-height: 210px; }
+  .ro { padding: 4px; }
+  .ro .v { font-size: clamp(15px, 2vh, 22px); }
+  .ro.big .v { font-size: clamp(20px, 2.7vh, 30px); }
+  .mixer { padding: 22px 8px 8px; }
+  .strips { grid-template-columns: minmax(0, 1fr) 42px minmax(0, 1fr); gap: 4px; }
+  .strip { grid-template-columns: 40px minmax(0, 1fr); gap: 4px; }
+  .knob canvas { width: clamp(18px, 2.2vh, 30px); height: clamp(18px, 2.2vh, 30px); }
+  .fader { width: 22px; }
+  .xlabels { font-size: 8px; letter-spacing: 1px; }
+  .fx .kind { font-size: 15px; letter-spacing: 1px; }
+  .blendsel { gap: 4px; letter-spacing: 1px; }
+  .blendsel span { padding: 2px 5px; }
+  .tab { padding: 4px 6px; letter-spacing: 1px; }
+}
+
+@media (max-width: 1050px) {
+  html, body { height: auto; min-height: 100%; overflow-x: hidden; overflow-y: auto; }
+  #app { height: auto; min-height: 100vh; min-height: 100svh; grid-template-rows: auto 130px auto auto; }
+  header { min-height: 44px; flex-wrap: wrap; gap: 8px; padding: 4px; }
+  #clock { margin-left: auto; font-size: 16px; }
+  #mid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-areas: "deck1 deck2" "mixer mixer";
+    align-items: stretch;
+  }
+  .deck[data-slot="1"] { grid-area: deck1; }
+  .deck[data-slot="2"] { grid-area: deck2; }
+  .mixer { grid-area: mixer; min-height: 400px; }
+  .deck { min-height: 340px; }
+  #bottom {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-areas: "crate crate" "next kaia";
+    align-items: stretch;
+  }
+  .crate { grid-area: crate; min-height: 320px; }
+  .next { grid-area: next; min-height: 220px; }
+  .kaia { grid-area: kaia; min-height: 220px; }
+  .tabs { flex-wrap: wrap; }
+}
+
+@media (max-width: 650px) {
+  #app { padding: 6px; gap: 8px; grid-template-rows: auto 115px auto auto; }
+  header { gap: 5px; }
+  .logo { font-size: 16px; letter-spacing: 1px; }
+  .pill { gap: 4px; padding: 3px 5px; font-size: 9px; letter-spacing: 0; }
+  #clock { font-size: 14px; letter-spacing: 1px; }
+  #mid {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: "deck1" "deck2" "mixer";
+  }
+  .deck { min-height: 320px; }
+  .mixer { min-height: 420px; }
+  .dbody { grid-template-columns: minmax(90px, 36%) minmax(0, 1fr); }
+  .jogwrap { min-height: 0; max-height: 180px; }
+  .transport { gap: 4px; }
+  .btn { min-width: 58px; padding: 7px 10px; font-size: 10px; }
+  #auto { padding: 0 7px; }
+  .strips { grid-template-columns: minmax(0, 1fr) 36px minmax(0, 1fr); gap: 3px; }
+  .strip { grid-template-columns: 34px minmax(0, 1fr); gap: 3px; }
+  .knob canvas { width: 24px; height: 24px; }
+  .vu { width: 11px; }
+  .fader { width: 20px; }
+  #bottom { grid-template-columns: minmax(0, 1fr); grid-template-areas: "crate" "next" "kaia"; }
+  .crate { min-height: 300px; }
+  .next { min-height: 180px; }
+  .kaia { min-height: 200px; }
+  .tabs { gap: 2px; }
+  .tab { padding: 4px 5px; font-size: 9px; letter-spacing: .5px; }
+  .tabs .count { font-size: 9px; }
+  #collapse { margin-left: 2px; padding: 2px 4px; }
+  .trk { grid-template-columns: minmax(0, 1fr) 38px 32px 44px; gap: 3px; font-size: 11px; }
+}
+
+@media (max-height: 720px) and (min-width: 1051px) {
+  html, body { height: auto; min-height: 100%; overflow-x: hidden; overflow-y: auto; }
+  #app { height: auto; min-height: 100vh; min-height: 100svh; grid-template-rows: 44px 140px minmax(340px, 1fr) 220px; }
+  .deck { min-height: 340px; }
+  .mixer { min-height: 360px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: .01ms !important;
+  }
+}
+
+</style>
+</head>
+<body>
+<canvas id="fxbg"></canvas><canvas id="fxtop"></canvas>
+<div id="toast"></div>
+<div id="idle"><div><div class="big">KAIA · BOOTH</div><div class="sub">NO SET RUNNING — <b>!music records</b> IN DISCORD</div></div></div>
+<div id="app">
+  <header>
+    <div class="logo">KAIA<span>//</span>BOOTH</div>
+    <div class="pill"><span class="dot" id="livedot"></span><b id="chan">—</b></div>
+    <div class="pill">SET <b id="uptime">00:00</b></div>
+    <div class="pill">TRACKS <b id="played">0</b></div>
+    <div class="pill">EARS <b id="ears">0</b></div>
+    <div class="pill" id="voicepill">VOICE <b id="voice">—</b></div>
+    <div class="pill" id="fxbtn" title="the stage: beat-synced visuals, Kaia's hands as reticles, an aura that builds on locked blends and red when one doesn't lock">FX <b id="fxstate">ON</b></div>
+    <div class="spacer"></div>
+    <div id="clock">00:00:00</div>
+  </header>
+
+  <div class="panel" style="--accent: var(--cyan)"><div class="ptitle">PARALLEL WAVEFORM · BEATGRID</div><canvas id="lanes"></canvas></div>
+
+  <div id="mid">
+    <div class="panel deck" data-slot="1" id="deck1"></div>
+    <div class="panel mixer">
+      <div class="ptitle">MIXER · DJM <span id="mdelay" title="meter delay — match the meters to what you hear in Discord, which plays the mix a little after the mixer makes it">METERS +0 ms</span></div>
+      <div class="strips">
+        <div class="strip" id="strip1"></div>
+        <div class="mastercol"><div class="lbl">MASTER</div><div class="mvu"><canvas class="vu" id="mvuL"></canvas><canvas class="vu" id="mvuR"></canvas></div><div class="mk"><div class="knob"><canvas id="mknob" title="master volume — drag, double-click to reset"></canvas>MST</div><div class="knob"><canvas id="phknob" title="headphones (CUE) volume — this window only"></canvas>PH</div></div></div>
+        <div class="strip" id="strip2"></div>
+      </div>
+      <div><canvas id="xf"></canvas><div class="xlabels"><span>CH 1</span><span>CROSSFADER</span><span>CH 2</span></div></div>
+      <div class="fx">
+        <div class="blendsel" id="blendsel" title="how long kaia blends one record into the next">BLEND
+          <span data-beats="32">SHORT</span><span data-beats="64">LONG</span><span data-beats="256" title="two minutes at 125 bpm, a full minute of it both records up">EPIC</span><em id="blendsec"></em><span id="rides" title="kaia riding the EQs and gains through the set — phrase by phrase">HANDS</span></div>
+        <div class="row"><div class="kind" id="fxkind">—</div><div class="count" id="fxcount"></div></div>
+        <div class="why" id="fxwhy">no transition planned</div>
+        <canvas id="prog"></canvas>
+      </div>
+      <div class="btns"><button id="skip">NEXT ▸▸</button><button id="auto" title="hand the mixer back to Kaia">KAIA MIX</button><div id="skiphint">—</div></div>
+    </div>
+    <div class="panel deck" data-slot="2" id="deck2"></div>
+  </div>
+
+  <div id="bottom">
+    <div class="panel crate">
+      <div class="tabs"><span class="tab on" data-tab="crate">BY GENRE</span><span class="tab" data-tab="match" title="what sits with the record playing, by Camelot key and tempo">MATCHES</span><span class="tab" data-tab="set">SET LIST</span><span class="tab" data-tab="sets" title="kaia's pre-measured sets: every transition in each was measured to lock">SETS</span><span class="count" id="cratecount"></span><span id="collapse" title="fold or unfold every group">FOLD ALL</span></div>
+      <input id="search" placeholder="search the crate — click a record to load it on the free deck" autocomplete="off">
+      <div class="scroll" id="cratepane"></div>
+      <div class="scroll list" id="setpane" style="padding:0"><ol id="setlist"></ol></div>
+      <div class="scroll" id="setspane"></div>
+    </div>
+    <div class="panel next"><div class="ptitle" id="nxt-title">NEXT IN THE CRATE</div><div><div class="t" id="nxt-t">choosing…</div><div class="a" id="nxt-a"></div></div><div class="chips" id="nxt-chips"></div></div>
+    <div class="panel kaia"><div id="kaia-stage"></div><div class="ptitle">KAIA ON THE DECKS</div>
+      <div class="ears" id="earlist"></div>
+      <div id="kaialog" title="her decisions and mood readings">LOG</div>
+      <div id="kaiadetail"><div class="mood" id="mood"></div><div class="feed" id="feed"></div></div>
+      <div class="say" id="say">—</div>
+    </div>
+  </div>
+</div>
+
+<script src="/kaia/js/kaia-shaders.js"></script>
+<script src="/kaia/js/kaia-renderer.js"></script>
+<script src="/kaia/js/kaia-animator.js"></script>
+<script src="/kaia/js/kaia-codec.js"></script>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const CSS = getComputedStyle(document.documentElement);
+const C = (n) => CSS.getPropertyValue(n).trim();
+const COL = { cyan: C("--cyan"), pink: C("--pink"), green: C("--green"), yellow: C("--yellow"), red: C("--red"),
+  purple: C("--purple"), dim: C("--dim"), faint: C("--faint"), line: C("--line"), text: C("--text") };
+const DECK = { 1: COL.cyan, 2: COL.pink };
+const RGB = { 1: [0, 240, 255], 2: [255, 47, 209] };
+
+let S = null, recvAt = 0;
+const waves = {};          // id -> {cps, n, data: Uint8Array} | "pending"
+const peaks = { 1: -90, 2: -90, mL: -90, mR: -90 };
+// ── the meters: every 20 ms frame's level, played back on the page's clock ──
+// The stream carries each frame's levels (frame number, slot on air, on-air,
+// other, master dB). The page maps frame numbers to its own clock by the
+// steadiest arrival seen (stream jitter only ever makes a frame late), shows
+// the frame METER_BUF behind that, plus the delay chosen to line up with what
+// Discord plays — and takes the loudest frame since the last draw, so a kick
+// between two draws is never skipped.
+const METER_BUF = 0.06, FRAME_S = 0.02, METER_DELAYS = [0, 80, 160, 240, 320, 400];
+const meterRows = new Map();
+let meterOffset = null, meterOffsetAt = 0, meterShown = -1;
+let meterDelay = 0;
+try { meterDelay = +(localStorage.getItem("kaia.meterDelay") || 0); } catch (_) {}
+const vu = { 1: -90, 2: -90, m: -90 }, vuAt = { t: 0 };
+let meterLastFrame = -1;
+function meterIngest() {
+  // A new set (or none) restarts the mixer's frame count: start the clock
+  // mapping over, or a reused booth window shows frozen meters.
+  if (!S || !S.live || S.frame == null || S.frame < meterLastFrame) {
+    meterOffset = null; meterRows.clear(); meterShown = -1;
+  }
+  meterLastFrame = S && S.live && S.frame != null ? S.frame : -1;
+  if (!S || !S.meter) return;
+  for (const r of S.meter) meterRows.set(r[0], r);
+  if (S.frame != null) {
+    const est = recvAt - S.frame * FRAME_S, now = performance.now() / 1000;
+    // the lowest estimate is the least delayed delivery; let it drift up slowly
+    if (meterOffset === null || est < meterOffset || now - meterOffsetAt > 5) { meterOffset = meterOffset === null || est < meterOffset ? est : meterOffset + 0.004; meterOffsetAt = now; }
+  }
+  if (meterRows.size > 200) for (const k of [...meterRows.keys()].sort((a, b) => a - b).slice(0, meterRows.size - 200)) meterRows.delete(k);
+}
+function meterLevels() {
+  // {1, 2, m}: the loudest of the frames since the last draw, VU ballistics on top
+  const now = performance.now() / 1000;
+  const peak = { 1: -90, 2: -90, m: -90 };
+  if (meterOffset !== null) {
+    const target = Math.floor((now - meterOffset - METER_BUF - meterDelay / 1000) / FRAME_S);
+    const from = meterShown < 0 || target - meterShown > 10 ? target - 1 : meterShown;
+    for (let f = from + 1; f <= target; f++) {
+      const r = meterRows.get(f); if (!r) continue;
+      const on = r[1], other = 3 - on;
+      peak[on] = Math.max(peak[on], r[2]); peak[other] = Math.max(peak[other], r[3]); peak.m = Math.max(peak.m, r[4]);
+    }
+    meterShown = Math.max(meterShown, target);
+  }
+  const dt = Math.min(0.1, now - (vuAt.t || now)); vuAt.t = now;
+  for (const k of [1, 2, "m"]) vu[k] = Math.max(peak[k], vu[k] - 45 * dt);     // instant attack, 45 dB/s release
+  return vu;
+}
+const shown = { 1: { low: 0, high: 0, level: -90 }, 2: { low: 0, high: 0, level: -90 }, master: -90 };
+
+// ── stream ───────────────────────────────────────────────────────
+function connect() {
+  const es = new EventSource("/events");
+  es.onmessage = (e) => { S = JSON.parse(e.data); kaiaRelaunch(S.launch); recvAt = performance.now() / 1000; meterIngest(); wantWaves(); };
+  es.onerror = () => { es.close(); setTimeout(connect, 1500); };
+}
+function wantWaves() {
+  if (!S || !S.decks) return;
+  for (const d of Object.values(S.decks)) {
+    if (!d.id || waves[d.id]) continue;
+    waves[d.id] = "pending";
+    const get = () => fetch("/wave/" + d.id).then((r) => {
+      if (r.status === 202) { setTimeout(get, 800); return null; }
+      return r.ok ? r.json() : null;
+    }).then((w) => {
+      if (!w || !w.data) return;
+      const bin = atob(w.data), u = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+      waves[d.id] = { cps: w.cols_per_s, n: u.length / 3, data: u };
+    }).catch(() => { delete waves[d.id]; });
+    get();
+  }
+}
+
+// ── time & music helpers ─────────────────────────────────────────
+const now = () => performance.now() / 1000;
+const since = () => Math.min(0.5, now() - recvAt);          // never run on more than half a second blind
+// A cue being dragged (or just let go, until the stream catches up) is shown
+// where the hand has it.
+const dragCue = {}, dragUntil = {};
+function dragged(slot) { return dragCue[slot] != null && performance.now() < (dragUntil[slot] || 0) ? dragCue[slot] : null; }
+function posOf(d) {
+  const dc = dragged(d.slot); if (dc !== null) return dc;
+  return d.state === "playing" && !(S.paused || []).includes(d.slot) ? Math.min(d.length, d.pos + since() * d.ratio) : d.pos;
+}
+const isFree = (slot) => !!(S && S.free === slot && S.decks && S.decks[slot]);
+const blendOn = () => !!(S && S.mix && S.mix.started);
+const canScrub = (slot) => isFree(slot) && !blendOn();
+const handDeck = () => { const d = S && S.decks && S.decks[S.free]; return d && d.hand && !S.mix && (d.state === "playing" || d.state === "cued") ? d : null; };
+function mixNow() { return S.mix ? S.mix.now + since() : 0; }
+function beatLen(d) { return d.grid ? 60 / d.grid.bpm : null; }
+function beatAt(d, pos) { const b = beatLen(d); return b ? (pos - d.grid.downbeat) / b : null; }
+const fmt = (s) => { if (!isFinite(s)) return "--:--"; s = Math.max(0, s); const m = Math.floor(s / 60); const r = Math.floor(s % 60); return `${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`; };
+function camelot(k) { const m = /^(\d{1,2})([AB])$/i.exec((k || "").trim()); return m ? [+m[1], m[2].toUpperCase()] : null; }
+function keyColor(k) { const c = camelot(k); if (!c) return COL.dim; const h = ((c[0] - 1) * 30 + 140) % 360; return `hsl(${h} 95% ${c[1] === "A" ? 60 : 70}%)`; }
+function keyRelation(a, b) {
+  const x = camelot(a), y = camelot(b); if (!x || !y) return ["key ?", "ok"];
+  if (x[0] === y[0] && x[1] === y[1]) return ["SAME KEY", "good"];
+  if (x[0] === y[0]) return ["RELATIVE " + (y[1] === "A" ? "MINOR" : "MAJOR"), "good"];
+  const d = ((y[0] - x[0]) % 12 + 12) % 12;
+  if (x[1] === y[1] && (d === 1 || d === 11)) return [`HARMONIC ${d === 1 ? "+1" : "−1"}`, "good"];
+  if (x[1] === y[1] && (d === 2 || d === 10)) return [`ENERGY ${d === 2 ? "+2" : "−2"}`, "ok"];
+  return ["CLASH", "bad"];
+}
+function hashHue(s) { let h = 0; for (const ch of s || "") h = (h * 31 + ch.charCodeAt(0)) >>> 0; return h % 360; }
+
+// ── canvas helpers ───────────────────────────────────────────────
+// Canvas sizes, kept by a ResizeObserver. Asking each canvas for its size
+// every frame (getBoundingClientRect) after the frame had written text into
+// the page forced a full layout per canvas: over half the booth's CPU.
+const SIZES = new WeakMap();
+const sizeWatch = new ResizeObserver((entries) => {
+  for (const e of entries) {
+    const b = e.borderBoxSize && e.borderBoxSize[0];
+    SIZES.set(e.target, b ? { w: b.inlineSize, h: b.blockSize } : { w: e.contentRect.width, h: e.contentRect.height });
+  }
+});
+function fit(cv) {
+  let sz = SIZES.get(cv);
+  if (!sz) { const r = cv.getBoundingClientRect(); sz = { w: r.width, h: r.height }; SIZES.set(cv, sz); sizeWatch.observe(cv); }
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(sz.w * dpr)), h = Math.max(1, Math.round(sz.h * dpr));
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  const g = cv.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return [g, sz.w, sz.h];
+}
+function glow(g, color, blur) { g.shadowColor = color; g.shadowBlur = blur; }
+function noGlow(g) { g.shadowBlur = 0; }
+
+// ── build the deck and strip DOM once ────────────────────────────
+function buildDeck(slot) {
+  $("deck" + slot).innerHTML = `
+    <div class="dtop"><div class="dnum">${slot}</div>
+      <span class="badge" data-b="master">MASTER</span><span class="badge" data-b="sync">SYNC</span>
+      <span class="badge" data-b="key">KEY</span><span class="badge" data-b="grid">GRID</span>
+      <span class="badge" data-b="gain">GAIN</span>
+      <div class="state" data-f="state">EMPTY</div></div>
+    <div class="dtitle"><div class="t" data-f="title">—</div><div class="a" data-f="artist">&nbsp;</div><div class="g" data-f="genre">&nbsp;</div></div>
+    <div class="dbody">
+      <div class="jogwrap"><canvas class="jog" data-c="jog"></canvas></div>
+      <div class="readouts">
+        <div class="ro big"><div class="k">BPM</div><div class="v" data-f="bpm">--.-</div></div>
+        <div class="ro"><div class="k">TEMPO</div><div class="v" data-f="pitch">±0.00<small>%</small></div></div>
+        <div class="ro"><div class="k">ELAPSED</div><div class="v" data-f="el">--:--</div></div>
+        <div class="ro" data-r="remain"><div class="k">REMAIN</div><div class="v" data-f="rem">--:--</div></div>
+        <div class="ro" style="grid-column: span 2"><div class="k">BAR · BEAT</div><div class="v" data-f="bar">--</div>
+          <div class="beats" data-f="beats"><i></i><i></i><i></i><i></i></div></div>
+      </div>
+    </div>
+    <canvas class="ov" data-c="ov"></canvas>
+    <div class="transport"><div class="btn cue" data-f="cue" title="free deck: hold to hear from the cue point in the headphones; while playing, back to the cue">CUE</div><div class="btn play" data-f="play" title="play / pause — the free deck starts on the beat, synced">▶ ❙❙</div><div class="btn ph" data-f="ph" title="headphones: hear this deck in this window, not on air">PHONES</div>
+      <canvas class="phase" data-c="phase" style="flex:1"></canvas>
+      <div class="meta" data-f="meta"></div></div>`;
+}
+function buildStrip(slot) {
+  const col = DECK[slot];
+  $("strip" + slot).innerHTML = `
+    <div class="ch" style="color:${col};text-shadow:0 0 10px ${col}">CH ${slot}</div>
+    <div class="knobs">
+      <div class="knob" data-n="trim"><canvas data-k="trim" title="trim — drag, double-click to reset"></canvas>TRIM</div>
+      <div class="knob" data-n="high"><canvas data-k="high" title="high EQ — drag, double-click to reset"></canvas>HI<em class="kbadge" data-kb="high"></em></div>
+      <div class="knob" data-n="mid"><canvas data-k="mid" title="mid EQ — drag, double-click to reset"></canvas>MID<em class="kbadge" data-kb="mid"></em></div>
+      <div class="knob" data-n="low"><canvas data-k="low" title="low EQ — drag, double-click to reset"></canvas><span data-k="lowlbl">LOW</span><em class="kbadge" data-kb="low"></em></div>
+    </div>
+    <div class="fadebox"><canvas class="vu" data-k="vu"></canvas><canvas class="fader" data-k="fader"></canvas></div>`;
+}
+[1, 2].forEach((s) => { buildDeck(s); buildStrip(s); });
+const q = (slot, sel) => $("deck" + slot).querySelector(sel);
+const qs = (slot, sel) => $("strip" + slot).querySelector(sel);
+
+let skipLock = 0;
+$("skip").onclick = () => { skipLock = performance.now() + 900; fetch("/skip", { method: "POST" }).catch(() => {}); };
+
+// ── the parallel waveform ────────────────────────────────────────
+const WINDOW_S = 7;   // played seconds either side of the playhead
+function drawLanes() {
+  const [g, W, H] = fit($("lanes"));
+  g.clearRect(0, 0, W, H);
+  const top = 20, laneH = (H - top - 6) / 2, cx = W * 0.5, pps = W / (2 * WINDOW_S);
+  const mix = S && S.mix;
+  const mnow = mix ? mixNow() : 0;
+  [1, 2].forEach((slot, i) => {
+    const y0 = top + i * laneH, mid = y0 + laneH / 2, amp = laneH / 2 - 6;
+    const d = S && S.decks && S.decks[slot];
+    g.fillStyle = "rgba(0,0,0,.35)"; g.fillRect(0, y0 + 2, W, laneH - 4);
+    g.strokeStyle = COL.line; g.lineWidth = 1; g.beginPath(); g.moveTo(0, mid); g.lineTo(W, mid); g.stroke();
+    if (!d) { g.fillStyle = COL.faint; g.font = "600 12px JetBrains Mono"; g.fillText(`DECK ${slot} · EMPTY`, 14, mid + 4); return; }
+    const w = waves[d.id], pos = posOf(d), ratio = d.ratio || 1, [r, gg, b] = RGB[slot];
+    // where this deck sits on the shared timeline: the outgoing deck's played clock
+    const xOf = (t) => cx + (t - pos) / ratio * pps;
+    // transition shading on both lanes
+    if (mix) {
+      const outD = S.decks[mix.out_slot];
+      const toX = (tPlayed) => cx + (tPlayed - mnow) * pps;
+      if (mix.kind === "blend" || mix.kind === "fade") {
+        const x1 = toX(mix.drop), x2 = toX(mix.done), xs = toX(mix.drop + mix.length / 2);
+        const grd = g.createLinearGradient(x1, 0, x2, 0);
+        grd.addColorStop(0, "rgba(61,255,138,.0)"); grd.addColorStop(.5, "rgba(61,255,138,.10)"); grd.addColorStop(1, "rgba(61,255,138,.0)");
+        g.fillStyle = grd; g.fillRect(x1, y0 + 2, x2 - x1, laneH - 4);
+        g.strokeStyle = "rgba(255,228,92,.8)"; g.setLineDash([4, 4]); g.beginPath(); g.moveTo(xs, y0 + 2); g.lineTo(xs, y0 + laneH - 2); g.stroke(); g.setLineDash([]);
+        if (i === 0) { g.fillStyle = COL.yellow; g.font = "600 9px JetBrains Mono"; g.fillText("BASS SWAP", xs + 4, y0 + 12); }
+        g.strokeStyle = COL.green; g.lineWidth = 2; glow(g, COL.green, 8);
+        g.beginPath(); g.moveTo(x1, y0 + 2); g.lineTo(x1, y0 + laneH - 2); g.stroke(); noGlow(g); g.lineWidth = 1;
+        if (i === 0) { g.fillStyle = COL.green; g.font = "700 9px JetBrains Mono"; g.fillText("DROP", x1 + 4, y0 + 12); }
+      } else {
+        const x1 = toX(mix.drop);
+        g.strokeStyle = COL.yellow; g.lineWidth = 2; glow(g, COL.yellow, 8); g.beginPath(); g.moveTo(x1, y0 + 2); g.lineTo(x1, y0 + laneH - 2); g.stroke(); noGlow(g); g.lineWidth = 1;
+        if (i === 0) { g.fillStyle = COL.yellow; g.font = "700 9px JetBrains Mono"; g.fillText("CUT", x1 + 4, y0 + 12); }
+      }
+    }
+    // the waveform, three bands: low the deck's colour, mid brighter, highs white
+    if (w && w !== "pending") {
+      for (let x = 0; x < W; x += 2) {
+        const t = pos + (x - cx) / pps * ratio;
+        const c = Math.floor(t * w.cps);
+        if (c < 0 || c >= w.n) continue;
+        let lo = 0, mi = 0, hi = 0;
+        const c2 = Math.min(w.n, c + Math.max(1, Math.round(w.cps * 2 * ratio / pps)));
+        for (let k = c; k < c2; k++) { lo = Math.max(lo, w.data[k * 3]); mi = Math.max(mi, w.data[k * 3 + 1]); hi = Math.max(hi, w.data[k * 3 + 2]); }
+        const played = x < cx;
+        const a = played ? 0.45 : 1;
+        const hl = lo / 255 * amp, hm = mi / 255 * amp * 0.75, hh = hi / 255 * amp * 0.5;
+        g.fillStyle = `rgba(${r * 0.55 | 0},${gg * 0.35 | 0},${b | 0},${0.75 * a})`; g.fillRect(x, mid - hl, 2, hl * 2);
+        g.fillStyle = `rgba(${r},${gg},${b},${0.85 * a})`; g.fillRect(x, mid - hm, 2, hm * 2);
+        g.fillStyle = `rgba(235,250,255,${0.9 * a})`; g.fillRect(x, mid - hh, 2, hh * 2);
+      }
+    } else {
+      g.fillStyle = COL.dim; g.font = "600 11px JetBrains Mono"; g.fillText("ANALYSING WAVEFORM…", cx + 14, mid + 4);
+    }
+    // beat grid
+    if (d.grid) {
+      const bl = 60 / d.grid.bpm, db = d.grid.downbeat;
+      const k0 = Math.floor((pos - WINDOW_S * ratio - db) / bl), k1 = Math.ceil((pos + WINDOW_S * ratio - db) / bl);
+      for (let k = k0; k <= k1; k++) {
+        const x = xOf(db + k * bl);
+        if (x < 0 || x > W) continue;
+        const bar = k % 4 === 0, phrase = k % 64 === 0;
+        g.strokeStyle = phrase ? "rgba(255,228,92,.85)" : bar ? `rgba(${r},${gg},${b},.75)` : "rgba(214,226,255,.16)";
+        g.lineWidth = phrase ? 2 : 1;
+        g.beginPath(); g.moveTo(x, y0 + 3); g.lineTo(x, bar ? y0 + laneH - 3 : y0 + 10); g.stroke();
+        if (bar && k >= 0) { g.fillStyle = `rgba(${r},${gg},${b},.9)`; g.font = "600 9px JetBrains Mono"; g.fillText(String(k / 4 + 1), x + 3, y0 + laneH - 6); }
+      }
+      g.lineWidth = 1;
+    }
+    // lane label
+    g.fillStyle = "rgba(4,6,12,.75)"; g.fillRect(8, y0 + 6, 154, 20);
+    g.fillStyle = DECK[slot]; g.font = "800 11px Orbitron, JetBrains Mono";
+    g.fillText(`DECK ${slot}  ${d.tempo ? d.tempo.toFixed(1) : "--.-"}`, 14, y0 + 20);
+  });
+  // playhead
+  g.strokeStyle = "#fff"; g.lineWidth = 2; glow(g, "#fff", 12);
+  g.beginPath(); g.moveTo(cx, top); g.lineTo(cx, H - 4); g.stroke(); noGlow(g);
+  g.fillStyle = "#fff"; g.beginPath(); g.moveTo(cx - 6, top - 2); g.lineTo(cx + 6, top - 2); g.lineTo(cx, top + 6); g.fill();
+}
+
+// ── a CDJ ────────────────────────────────────────────────────────
+function drawJog(slot, d) {
+  const cv = q(slot, '[data-c="jog"]'); const [g, W, H] = fit(cv);
+  const R = Math.min(W, H) / 2 - 4, cx = W / 2, cy = H / 2, col = DECK[slot];
+  g.clearRect(0, 0, W, H);
+  const pos = d ? posOf(d) : 0, len = d ? d.length : 1, frac = d ? Math.min(1, pos / Math.max(1, len)) : 0;
+  const playing = d && d.state === "playing";
+  // position ring: 60 segments
+  for (let i = 0; i < 60; i++) {
+    const a0 = -Math.PI / 2 + i / 60 * Math.PI * 2 + 0.012, a1 = a0 + Math.PI * 2 / 60 - 0.024;
+    const lit = i / 60 < frac;
+    const nearEnd = d && (len - pos) / (d.ratio || 1) < 30 && playing;
+    g.strokeStyle = lit ? (nearEnd ? COL.red : col) : "rgba(42,53,84,.7)";
+    g.lineWidth = 7; if (lit) glow(g, nearEnd ? COL.red : col, 10);
+    g.beginPath(); g.arc(cx, cy, R - 4, a0, a1); g.stroke(); noGlow(g);
+  }
+  // platter
+  const pr = R - 14;
+  const grad = g.createRadialGradient(cx, cy, pr * 0.2, cx, cy, pr);
+  grad.addColorStop(0, "#111a2c"); grad.addColorStop(1, "#060a13");
+  g.fillStyle = grad; g.beginPath(); g.arc(cx, cy, pr, 0, Math.PI * 2); g.fill();
+  g.strokeStyle = "rgba(214,226,255,.06)";
+  for (let rr = pr * 0.45; rr < pr; rr += 5) { g.beginPath(); g.arc(cx, cy, rr, 0, Math.PI * 2); g.stroke(); }
+  // rotation: 33⅓ rpm of played time
+  const ang = d ? (pos / (d.ratio || 1)) * (33.333 / 60) * Math.PI * 2 : 0;
+  g.save(); g.translate(cx, cy); g.rotate(ang);
+  for (let i = 0; i < 4; i++) { g.rotate(Math.PI / 2); g.fillStyle = "rgba(214,226,255,.08)"; g.fillRect(pr * 0.5, -1, pr * 0.45, 2); }
+  g.strokeStyle = playing ? col : COL.dim; g.lineWidth = 3; if (playing) glow(g, col, 10);
+  g.beginPath(); g.moveTo(0, -pr * 0.42); g.lineTo(0, -pr + 3); g.stroke(); noGlow(g);
+  // label
+  const hue = d ? hashHue(d.name) : 220;
+  const lg = g.createRadialGradient(0, 0, 2, 0, 0, pr * 0.4);
+  lg.addColorStop(0, `hsl(${hue} 90% 60%)`); lg.addColorStop(1, `hsl(${(hue + 60) % 360} 80% 22%)`);
+  g.fillStyle = d ? lg : "#0b1120"; g.beginPath(); g.arc(0, 0, pr * 0.38, 0, Math.PI * 2); g.fill();
+  g.fillStyle = "rgba(255,255,255,.85)"; g.font = `800 ${Math.round(pr * 0.13)}px Orbitron, JetBrains Mono`; g.textAlign = "center";
+  g.fillText(d ? (d.artist || d.title || "?").slice(0, 10).toUpperCase() : "", 0, -pr * 0.08);
+  g.font = `600 ${Math.round(pr * 0.09)}px JetBrains Mono`; g.fillText(d && d.key ? d.key : "", 0, pr * 0.16);
+  g.fillStyle = "#04060c"; g.beginPath(); g.arc(0, 0, 4, 0, Math.PI * 2); g.fill();
+  g.restore(); g.textAlign = "left";
+}
+function drawOverview(slot, d) {
+  const [g, W, H] = fit(q(slot, '[data-c="ov"]')); g.clearRect(0, 0, W, H);
+  if (!d) return;
+  const w = waves[d.id], len = Math.max(1, d.length), pos = posOf(d), [r, gg, b] = RGB[slot], mid = H / 2;
+  if (w && w !== "pending") {
+    const per = w.n / W;
+    for (let x = 0; x < W; x++) {
+      let lo = 0, mi = 0, hi = 0;
+      for (let k = Math.floor(x * per); k < Math.min(w.n, Math.floor((x + 1) * per)); k++) {
+        lo = Math.max(lo, w.data[k * 3]); mi = Math.max(mi, w.data[k * 3 + 1]); hi = Math.max(hi, w.data[k * 3 + 2]);
+      }
+      const played = x / W < pos / len, a = played ? 0.35 : 0.95, amp = mid - 3;
+      g.fillStyle = `rgba(${r * .5 | 0},${gg * .3 | 0},${b},${a * .8})`; g.fillRect(x, mid - lo / 255 * amp, 1, lo / 255 * amp * 2);
+      g.fillStyle = `rgba(${r},${gg},${b},${a})`; g.fillRect(x, mid - mi / 255 * amp * .7, 1, mi / 255 * amp * 1.4);
+      g.fillStyle = `rgba(235,250,255,${a})`; g.fillRect(x, mid - hi / 255 * amp * .4, 1, hi / 255 * amp * .8);
+    }
+  }
+  // transition points on this deck's own timeline
+  const mix = S.mix;
+  if (mix && String(slot) === mix.out_slot) {
+    const xd = mix.drop * mix.out_ratio / len * W, xe = mix.done * mix.out_ratio / len * W;
+    g.fillStyle = mix.kind === "blend" ? "rgba(61,255,138,.25)" : mix.kind === "fade" ? "rgba(162,89,255,.3)" : "rgba(255,228,92,.35)"; g.fillRect(xd, 0, Math.max(2, xe - xd), H);
+  }
+  if (isFree(slot) && d.bass_in != null && d.cue != null) {
+    const xb = d.bass_in / len * W;
+    g.fillStyle = "rgba(255,47,209,.85)"; g.fillRect(xb - 0.5, H - 9, 1, 9); g.font = "600 8px JetBrains Mono"; g.fillText("BASS", xb + 2, H - 2);
+  }
+  if (isFree(slot) && d.cue != null) {
+    const c = dragged(slot) ?? d.cue, xc = c / len * W;
+    g.fillStyle = COL.yellow; glow(g, COL.yellow, 8);
+    g.beginPath(); g.moveTo(xc - 5, 0); g.lineTo(xc + 5, 0); g.lineTo(xc, 7); g.fill(); g.fillRect(xc - 0.5, 0, 1, H); noGlow(g);
+  }
+  const xp = pos / len * W;
+  g.fillStyle = "#fff"; glow(g, "#fff", 8); g.fillRect(xp - 1, 0, 2, H); noGlow(g);
+  if (canScrub(slot) && d.state !== "playing") {
+    g.fillStyle = "rgba(255,228,92,.8)"; g.font = "600 9px JetBrains Mono"; g.fillText("DRAG TO CUE", W - 78, H - 5);
+  }
+}
+function drawPhase(slot, d) {
+  const [g, W, H] = fit(q(slot, '[data-c="phase"]')); g.clearRect(0, 0, W, H);
+  const n = 4, gap = 4, bw = (W - gap * (n - 1)) / n;
+  let lit = -1, off = 0;
+  if (d && d.grid) {
+    const bt = beatAt(d, posOf(d));
+    if (bt !== null && bt >= 0) lit = Math.floor(bt) % 4;
+    // phase against the other playing deck, in beats
+    const o = S.decks && S.decks[3 - slot];
+    if (o && o.grid && o.state === "playing" && d.state === "playing") {
+      const ob = beatAt(o, posOf(o)); off = ((bt - ob) % 1 + 1.5) % 1 - 0.5;
+    }
+  }
+  for (let i = 0; i < n; i++) {
+    const on = i === lit; g.fillStyle = on ? (i === 0 ? COL.yellow : DECK[slot]) : "rgba(42,53,84,.8)";
+    if (on) glow(g, g.fillStyle, 8); g.fillRect(i * (bw + gap), 2, bw, H - 4); noGlow(g);
+  }
+  if (off) { const x = W / 2 + off * W; g.fillStyle = Math.abs(off) < 0.05 ? COL.green : COL.red; g.fillRect(x - 2, 0, 4, H); }
+}
+function setBadge(slot, name, on, text, color, blink) {
+  const el = q(slot, `[data-b="${name}"]`); el.classList.toggle("on", !!on); el.classList.toggle("blink", !!blink);
+  if (text !== undefined) el.textContent = text; el.style.setProperty("--bc", color || "");
+}
+function updateDeck(slot) {
+  const d = S.decks && S.decks[slot];
+  const mix = S.mix;
+  const st = q(slot, '[data-f="state"]');
+  const states = { playing: ["PLAYING", COL.green], cued: ["CUED", COL.yellow], loaded: ["LOADED", COL.cyan], planning: ["SYNCING", COL.cyan] };
+  let [label, color] = d ? (states[d.state] || [d.state.toUpperCase(), COL.dim]) : ["EMPTY", COL.faint];
+  const byHand = d && d.hand && !mix && (d.state === "playing" || d.state === "cued");
+  if (byHand) [label, color] = d.state === "playing" ? ["HAND ▶", COL.pink] : ["ON THE BEAT…", COL.yellow];
+  else if (d && slot === S.on_air) label = (S.paused || []).includes(slot) ? "PAUSED" : "ON AIR";
+  if (S.loading && slot === S.free) [label, color] = ["LOADING…", COL.yellow];
+  st.textContent = d && d.buffering ? "LOADING" : label; st.style.color = color; st.style.textShadow = `0 0 10px ${color}`;
+  q(slot, '[data-f="title"]').textContent = d ? (d.title || d.name) : "—";
+  q(slot, '[data-f="artist"]').textContent = d && d.artist ? d.artist : "\u00a0";
+  q(slot, '[data-f="genre"]').textContent = d ? [d.genre, d.bpm ? `${d.bpm} BPM ORIG` : ""].filter(Boolean).join(" · ").toUpperCase() || "\u00a0" : "\u00a0";
+  const master = d && slot === S.on_air;
+  setBadge(slot, "master", master);
+  setBadge(slot, "sync", d && ((mix && mix.kind === "blend" && String(slot) === mix.in_slot) || (isFree(slot) && !mix && d.synced)), "SYNC", COL.green);
+  const kn = d && (d.key_now || d.key);
+  setBadge(slot, "key", kn, kn ? `KEY ${kn}${d.semitones ? ` ${d.semitones > 0 ? "+" : "−"}${Math.abs(d.semitones)}ST` : ""}` : "KEY", d ? keyColor(kn) : "");
+  q(slot, '[data-b="key"]').title = d && d.semitones ? `key sync: ${d.key} shifted ${d.semitones > 0 ? "up" : "down"} a semitone to sit with the other deck` : "";
+  setBadge(slot, "grid", d && d.grid, d && d.grid ? (d.grid.bar_known ? `BAR LOCK ${d.grid.contrast.toFixed(1)}` : `BEAT ${d.grid.contrast.toFixed(1)}`) : "GRID", d && d.grid ? (d.grid.bar_known && d.grid.contrast >= 4 ? COL.green : COL.yellow) : "");
+  setBadge(slot, "gain", d && d.gain_db, d && d.gain_db ? `GAIN ${d.gain_db > 0 ? "+" : ""}${d.gain_db.toFixed(1)}dB` : "GAIN", COL.purple);
+  const pos = d ? posOf(d) : 0, ratio = d ? d.ratio || 1 : 1;
+  q(slot, '[data-f="bpm"]').textContent = d && d.tempo ? d.tempo.toFixed(1) : "--.-";
+  const p = d ? d.pitch : 0;
+  q(slot, '[data-f="pitch"]').innerHTML = `${p >= 0 ? "+" : "−"}${Math.abs(p).toFixed(2)}<small>%</small>`;
+  q(slot, '[data-f="el"]').textContent = d ? fmt(pos / ratio) : "--:--";
+  const rem = d ? (d.length - pos) / ratio : NaN;
+  q(slot, '[data-f="rem"]').textContent = d ? "−" + fmt(rem) : "--:--";
+  q(slot, '[data-r="remain"]').classList.toggle("warn", !!(d && d.state === "playing" && rem < 30));
+  const bt = d ? beatAt(d, pos) : null;
+  const beats = q(slot, '[data-f="beats"]').children;
+  if (bt !== null && bt >= 0) {
+    const k = Math.floor(bt); q(slot, '[data-f="bar"]').textContent = `${Math.floor(k / 4) + 1}.${k % 4 + 1}`;
+    for (let i = 0; i < 4; i++) { beats[i].classList.toggle("on", i === k % 4); beats[i].classList.toggle("one", i === 0); }
+  } else {
+    q(slot, '[data-f="bar"]').textContent = bt !== null ? `−${Math.ceil(-bt)} BEATS` : "--";
+    for (const b of beats) b.classList.remove("on");
+  }
+  const paused = (S.paused || []).includes(slot);
+  q(slot, '[data-f="play"]').classList.toggle("lit", !!(d && d.state === "playing") && !paused);
+  q(slot, '[data-f="play"]').classList.toggle("paused", paused);
+  const free = isFree(slot);
+  const cue = q(slot, '[data-f="cue"]');
+  cue.classList.toggle("lit", !!(free && (d.state !== "playing" || byHand)));
+  cue.classList.toggle("blink", !!(d && d.state === "cued")); cue.classList.toggle("off", !free);
+  q(slot, '[data-f="ph"]').classList.toggle("lit", !!phonesOn[slot]);
+  q(slot, '[data-f="play"]').classList.toggle("off", !d || (free && blendOn()));
+  q(slot, '[data-c="ov"]').classList.toggle("scrub", canScrub(slot));
+  q(slot, '[data-c="jog"]').classList.toggle("scrub", canScrub(slot));
+  q(slot, '[data-f="meta"]').innerHTML = d ? `STRETCH <b>×${ratio.toFixed(4)}</b><br>LEN <b>${fmt(d.length / ratio)}</b>` : "";
+  drawJog(slot, d); drawOverview(slot, d); drawPhase(slot, d);
+}
+
+// ── the mixer ────────────────────────────────────────────────────
+function drawKnob(cv, value, color, bipolar, label) {
+  const [g, W, H] = fit(cv); g.clearRect(0, 0, W, H);
+  const cx = W / 2, cy = H / 2, R = Math.min(W, H) / 2 - 4;
+  const a0 = Math.PI * 0.75, a1 = Math.PI * 2.25;
+  g.lineWidth = 4; g.strokeStyle = "rgba(42,53,84,.9)"; g.beginPath(); g.arc(cx, cy, R, a0, a1); g.stroke();
+  const v = Math.max(0, Math.min(1, value)), av = a0 + (a1 - a0) * v, from = bipolar ? (a0 + a1) / 2 : a0;
+  g.strokeStyle = color; glow(g, color, 8); g.beginPath(); g.arc(cx, cy, R, Math.min(from, av), Math.max(from, av)); g.stroke(); noGlow(g);
+  g.fillStyle = "#0d1322"; g.beginPath(); g.arc(cx, cy, R - 6, 0, Math.PI * 2); g.fill();
+  g.strokeStyle = "#e8f3ff"; g.lineWidth = 2; g.beginPath(); g.moveTo(cx, cy); g.lineTo(cx + Math.cos(av) * (R - 7), cy + Math.sin(av) * (R - 7)); g.stroke();
+}
+function drawVU(cv, db, peakKey) {
+  const [g, W, H] = fit(cv); g.clearRect(0, 0, W, H);
+  const n = 18, gap = 2, sh = (H - gap * (n - 1)) / n;
+  const level = Math.max(0, Math.min(1, (db + 48) / 48));
+  peaks[peakKey] = Math.max(db, peaks[peakKey] - 0.6);
+  const peak = Math.max(0, Math.min(1, (peaks[peakKey] + 48) / 48));
+  for (let i = 0; i < n; i++) {
+    const f = (i + 1) / n, y = H - (i + 1) * (sh + gap) + gap;
+    const col = f > 0.89 ? COL.red : f > 0.72 ? COL.yellow : COL.green;
+    const on = f <= level + 1e-6, isPeak = Math.abs(f - Math.ceil(peak * n) / n) < 1e-6 && peak > 0.02;
+    g.fillStyle = on || isPeak ? col : "rgba(42,53,84,.55)";
+    if (on) glow(g, col, 6); g.fillRect(0, y, W, sh); noGlow(g);
+  }
+}
+function drawFader(cv, v, color) {
+  const [g, W, H] = fit(cv); g.clearRect(0, 0, W, H);
+  g.fillStyle = "rgba(0,0,0,.6)"; g.fillRect(W / 2 - 2, 6, 4, H - 12);
+  for (let i = 0; i <= 10; i++) { const y = 6 + (H - 12) * i / 10; g.fillStyle = COL.faint; g.fillRect(2, y, 5, 1); g.fillRect(W - 7, y, 5, 1); }
+  const y = 6 + (H - 12) * (1 - Math.max(0, Math.min(1, v)));
+  g.fillStyle = "#1a2440"; g.fillRect(2, y - 9, W - 4, 18);
+  g.fillStyle = color; glow(g, color, 10); g.fillRect(3, y - 1, W - 6, 2); noGlow(g);
+}
+function smooth(a, b, k) { return a + (b - a) * k; }
+// ── hands on the mixer ───────────────────────────────────────────
+const FLAT = { trim: 0, high: 1, mid: 1, low: 1, fader: 1 };
+const RANGE = { phones: [0, 1], trim: [-12, 12], high: [0, 1.5], mid: [0, 1.5], low: [0, 1.5], fader: [0, 1], master: [0, 1.5], xfader: [0, 1] };
+const local = {};            // "slot:name" -> {v, until}: what a hand just set, until the stream echoes it
+function post(path, body) {
+  return fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  }).then((r) => {
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r;
+  }).catch((err) => {
+    console.warn(`[dj] ${path} failed`, err);
+    return null;
+  });
+}
+function ctl(slot, name) {
+  const key = `${slot}:${name}`, l = local[key];
+  if (name === "phones") return phonesVol;
+  if (l && performance.now() < l.until) return l.v;
+  const c = S && S.controls;
+  if (!c) return name === "xfader" ? null : (name === "master" ? 1 : FLAT[name]);
+  if (name === "xfader") return c.xfader;
+  if (name === "master") return c.master;
+  return (c.channels[slot] || FLAT)[name];
+}
+let sendTimer = {};
+function setCtl(slot, name, v) {
+  const [lo, hi] = RANGE[name];
+  if (v !== null) v = Math.max(lo, Math.min(hi, v));
+  if (name === "phones") { phonesVol = v; return; }
+  local[`${slot}:${name}`] = { v, until: performance.now() + 1500 };
+  clearTimeout(sendTimer[`${slot}:${name}`]);
+  sendTimer[`${slot}:${name}`] = setTimeout(() => post("/control", { slot: slot || null, name, value: v }), 40);
+}
+// Knobs turn the way DJ software's do: press and drag — up turns it up, down
+// turns it down, Shift for fine — or use the wheel; double-click resets. The
+// pointer is captured, not locked: a lock made the browser announce "press Esc
+// to show your cursor" on every turn. Faders and the crossfader follow the
+// pointer directly.
+let turning = null;               // {slot, name}
+function knob(el, slot, name, reset) {
+  el.addEventListener("pointerdown", (e) => {
+    turning = { slot, name, y: e.clientY, x: e.clientX };
+    el.setPointerCapture(e.pointerId);
+    document.body.classList.add("turning");
+    e.preventDefault();
+  });
+  el.addEventListener("dblclick", () => setCtl(slot, name, reset));
+  el.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const [lo, hi] = RANGE[name];
+    setCtl(slot, name, (ctl(slot, name) ?? reset) + (e.deltaY < 0 ? 1 : -1) * (hi - lo) * (e.shiftKey ? 0.01 : 0.04));
+  }, { passive: false });
+}
+document.addEventListener("pointermove", (e) => {
+  if (!turning) return;
+  const [lo, hi] = RANGE[turning.name];
+  const d = ((e.clientX - turning.x) - (e.clientY - turning.y)) / (e.shiftKey ? 900 : 200);
+  turning.x = e.clientX; turning.y = e.clientY;
+  setCtl(turning.slot, turning.name, (ctl(turning.slot, turning.name) ?? lo) + d * (hi - lo));
+});
+const endTurn = () => { turning = null; document.body.classList.remove("turning"); };
+document.addEventListener("pointerup", endTurn);
+document.addEventListener("pointercancel", endTurn);
+// A pinch or ctrl+scroll zoomed the whole page and cut the mixer in half.
+window.addEventListener("wheel", (e) => { if (e.ctrlKey) e.preventDefault(); }, { passive: false });
+window.addEventListener("keydown", (e) => { if ((e.ctrlKey || e.metaKey) && ["+", "-", "=", "0"].includes(e.key)) e.preventDefault(); });
+function slider(el, slot, name, axis, reset) {
+  const place = (e) => {
+    const r = el.getBoundingClientRect(), [lo, hi] = RANGE[name];
+    const f = axis === "x" ? (e.clientX - r.left - 10) / Math.max(1, r.width - 20)
+                           : 1 - (e.clientY - r.top - 6) / Math.max(1, r.height - 12);
+    setCtl(slot, name, lo + Math.max(0, Math.min(1, f)) * (hi - lo));
+  };
+  let held = false;
+  el.addEventListener("pointerdown", (e) => { held = true; el.setPointerCapture(e.pointerId); place(e); e.preventDefault(); });
+  el.addEventListener("pointermove", (e) => { if (held) place(e); });
+  el.addEventListener("pointerup", () => { held = false; });
+  el.addEventListener("dblclick", () => setCtl(slot, name, reset));
+}
+[1, 2].forEach((slot) => {
+  for (const n of ["trim", "high", "mid", "low"]) knob(qs(slot, `[data-k="${n}"]`), slot, n, FLAT[n]);
+  slider(qs(slot, '[data-k="fader"]'), slot, "fader", "y", 1);
+  q(slot, '[data-f="play"]').addEventListener("click", () => {
+    if (!S || !S.decks || !S.decks[slot]) return;
+    const d = S.decks[slot];
+    post("/play", { slot });
+    if (slot === S.on_air) toast(`deck ${slot}: ${(S.paused || []).includes(slot) ? "playing" : "paused"}`);
+    else if (blendOn()) toast(`deck ${slot} is mid-blend — kaia has it`);
+    else if (d.hand && (d.state === "playing" || d.state === "cued")) toast(`deck ${slot} paused — ▶ starts it again on the beat`);
+    else toast(`deck ${slot} starts on the next ${d.synced ? "matching beat, synced" : "beat (tempo too far to sync)"} — bring its fader up to hear it`);
+  });
+  const cue = q(slot, '[data-f="cue"]');
+  cue.addEventListener("pointerdown", (e) => {
+    if (!isFree(slot)) { toast("CUE works on the free deck — the one not on air"); return; }
+    const d = S.decks[slot];
+    if (d.hand && (d.state === "playing" || d.state === "cued") && !S.mix) { post("/cue", { slot }); toast(`deck ${slot} back to its cue`); return; }
+    cueHeld[slot] = true; cue.setPointerCapture(e.pointerId);
+  });
+  const letGo = () => { cueHeld[slot] = false; };
+  cue.addEventListener("pointerup", letGo); cue.addEventListener("pointercancel", letGo);
+  q(slot, '[data-f="ph"]').addEventListener("click", () => {
+    phonesOn[slot] = !phonesOn[slot];
+    if (phonesOn[slot]) phonesOn[3 - slot] = false;           // one deck in the headphones at a time
+    toast(phonesOn[slot] ? `headphones: deck ${slot} (this window only, not on air)` : "headphones off");
+  });
+  scrubbing(slot);
+});
+slider($("xf"), 0, "xfader", "x", null);
+knob($("mknob"), 0, "master", 1);
+knob($("phknob"), 0, "phones", 0.8);
+$("blendsel").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-beats]"); if (!b) return;
+  post("/blend", { beats: +b.dataset.beats });
+  local["0:blend"] = { v: +b.dataset.beats, until: performance.now() + 1500 };
+  toast(`next blend: ${b.textContent.toLowerCase()} — ${b.dataset.beats} beats`);
+});
+$("rides").onclick = () => { post("/rides"); local["0:rides"] = { v: !(S && S.rides), until: performance.now() + 1500 };
+  toast(S && S.rides ? "kaia's hands off the mixer — just the blends" : "kaia's riding the mixer again"); };
+$("auto").onclick = () => {
+  post("/reset").then((r) => {
+    if (!r) { toast("couldn't hand the mixer back"); return; }
+    for (const k in local) delete local[k];
+    toast("the mixer is kaia's again");
+  });
+};
+let toastT = 0;
+function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add("show"); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove("show"), Math.max(2200, msg.length * 45)); }
+
+// ── headphones: a deck heard in this window, never on air ─────────
+// The booth plays the record's own file here, at the deck's tempo and from
+// where the deck is (or its cue, for a deck not playing), so a record can be
+// found and cued while the room hears only what is on air.
+const phones = {}, phonesOn = { 1: false, 2: false }, cueHeld = { 1: false, 2: false };
+let phonesVol = 0.8;
+function phonesTick(slot) {
+  const d = S && S.decks && S.decks[slot], a = phones[slot];
+  const live = d && d.state === "playing" && !(S.paused || []).includes(slot);
+  const want = d && (phonesOn[slot] || cueHeld[slot]);
+  if (!want) { if (a && !a.paused) a.pause(); if (a) a._from = null; return; }
+  let el = a;
+  if (!el || el._id !== d.id) {
+    if (el) el.pause();
+    el = new Audio("/audio/" + d.id); el._id = d.id; el.preservesPitch = true; el._from = null; el._seekAt = 0; phones[slot] = el;
+  }
+  el.volume = phonesVol; el.playbackRate = d.ratio || 1;
+  const t = posOf(d), at = performance.now();
+  if (live && dragged(slot) === null && !cueHeld[slot]) {
+    if (Math.abs(el.currentTime - t) > 0.25 && at - el._seekAt > 400) { el.currentTime = t; el._seekAt = at; }
+  } else if (el._from === null || (Math.abs(el._from - t) > 0.04 && at - el._seekAt > 90)) {
+    el.currentTime = t; el._from = t; el._seekAt = at;     // a deck not playing: heard from its cue
+  }
+  if (el.paused) el.play().catch(() => {});
+}
+// ── cueing the free deck: drag its overview, its jog, or its lane ──
+function moveCue(slot, pos) {
+  const d = S.decks[slot]; dragCue[slot] = Math.max(0, Math.min(d.length - 8, pos)); dragUntil[slot] = Infinity;
+}
+function commitCue(slot) {
+  if (dragCue[slot] == null) return;
+  dragUntil[slot] = performance.now() + 1500;
+  post("/cue", { slot, pos: dragCue[slot] });
+}
+function scrubbing(slot) {
+  const ov = q(slot, '[data-c="ov"]'), jog = q(slot, '[data-c="jog"]');
+  let held = null;
+  const frac = (e) => { const r = ov.getBoundingClientRect(); return Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)); };
+  ov.addEventListener("pointerdown", (e) => {
+    if (!canScrub(slot)) { toast(isFree(slot) ? "kaia is mid-blend on this deck" : "this deck is on air — cue the free deck"); return; }
+    held = "ov"; ov.setPointerCapture(e.pointerId); moveCue(slot, frac(e) * S.decks[slot].length);
+  });
+  ov.addEventListener("pointermove", (e) => { if (held === "ov") moveCue(slot, frac(e) * S.decks[slot].length); });
+  ov.addEventListener("pointerup", () => { if (held === "ov") { held = null; commitCue(slot); } });
+  // the jog: a full turn is sixteen beats
+  let ang = 0;
+  const angle = (e) => { const r = jog.getBoundingClientRect(); return Math.atan2(e.clientY - r.top - r.height / 2, e.clientX - r.left - r.width / 2); };
+  jog.addEventListener("pointerdown", (e) => {
+    if (!canScrub(slot)) { if (!isFree(slot)) toast("this deck is on air — cue the free deck"); return; }
+    held = "jog"; ang = angle(e); jog.setPointerCapture(e.pointerId); moveCue(slot, posOf(S.decks[slot]));
+  });
+  jog.addEventListener("pointermove", (e) => {
+    if (held !== "jog") return;
+    const a = angle(e); let da = a - ang; if (da > Math.PI) da -= 2 * Math.PI; if (da < -Math.PI) da += 2 * Math.PI; ang = a;
+    const d = S.decks[slot], beat = d.grid ? 60 / d.grid.bpm : 0.5;
+    moveCue(slot, dragCue[slot] + da / (2 * Math.PI) * 16 * beat);
+  });
+  jog.addEventListener("pointerup", () => { if (held === "jog") { held = null; commitCue(slot); } });
+}
+// the parallel waveform: drag the free deck's lane sideways
+(() => {
+  const cv = $("lanes"); let lane = null, lastX = 0;
+  cv.addEventListener("pointerdown", (e) => {
+    const r = cv.getBoundingClientRect(), top = 20, laneH = (r.height - top - 6) / 2;
+    const slot = (e.clientY - r.top) < top + laneH ? 1 : 2;
+    if (!canScrub(slot)) return;
+    lane = slot; lastX = e.clientX; cv.setPointerCapture(e.pointerId); moveCue(slot, posOf(S.decks[slot]));
+  });
+  cv.addEventListener("pointermove", (e) => {
+    if (!lane) return;
+    const r = cv.getBoundingClientRect(), pps = r.width / (2 * WINDOW_S), d = S.decks[lane];
+    moveCue(lane, dragCue[lane] - (e.clientX - lastX) / pps * (d.ratio || 1)); lastX = e.clientX;
+  });
+  cv.addEventListener("pointerup", () => { if (lane) { commitCue(lane); lane = null; } });
+})();
+function drawKnobV(cv, frac, color, flatFrac, autoFrac, kaia) {
+  // frac: what is applied (0–1 of the travel) — the hand's setting times Kaia's
+  // automix, so her moves turn the knob; flatFrac: where "no change" sits;
+  // autoFrac: where the hand alone has it, as a dot (null: the same)
+  // Redrawn only when something it shows has changed.
+  const key = [frac.toFixed(3), color, flatFrac, autoFrac == null ? "" : autoFrac.toFixed(3), kaia == null ? "" : kaia.toFixed(3)].join("|");
+  if (cv._drawn === key && SIZES.get(cv) && cv._w === SIZES.get(cv).w) return;
+  cv._drawn = key;
+  const [g, W, H] = fit(cv); cv._w = W; g.clearRect(0, 0, W, H);
+  const cx = W / 2, cy = H / 2, R = Math.min(W, H) / 2 - 4, a0 = Math.PI * 0.75, a1 = Math.PI * 2.25;
+  const at = (f) => a0 + (a1 - a0) * Math.max(0, Math.min(1, f));
+  g.lineWidth = 4; g.strokeStyle = "rgba(42,53,84,.9)"; g.beginPath(); g.arc(cx, cy, R, a0, a1); g.stroke();
+  const af = at(flatFrac), av = at(frac);
+  g.strokeStyle = color; glow(g, color, 8); g.beginPath(); g.arc(cx, cy, R, Math.min(af, av), Math.max(af, av) + 0.0001); g.stroke(); noGlow(g);
+  g.fillStyle = "#0d1322"; g.beginPath(); g.arc(cx, cy, R - 6, 0, Math.PI * 2); g.fill();
+  if (autoFrac != null && Math.abs(autoFrac - frac) > 0.01) {     // the hand's own setting, as a dot
+    const aa = at(autoFrac); g.fillStyle = COL.yellow; glow(g, COL.yellow, 6);
+    g.beginPath(); g.arc(cx + Math.cos(aa) * (R - 9), cy + Math.sin(aa) * (R - 9), 2.2, 0, Math.PI * 2); g.fill(); noGlow(g);
+  }
+  // Kaia's own hand: a pink arc on the outer ring from where the knob would
+  // be without her to where she has it, and a pink pointer while she holds it.
+  const her = kaia != null && Math.abs(kaia - 1) > 0.015;
+  if (her) {
+    const without = at(frac / Math.max(kaia, 0.001)), lo = Math.min(without, av), hi = Math.max(without, av);
+    g.strokeStyle = "rgba(255,47,209,.28)"; g.lineWidth = 1.5;               // her hand is on it
+    g.beginPath(); g.arc(cx, cy, R + 2.5, 0, Math.PI * 2); g.stroke();
+    g.strokeStyle = COL.pink; g.lineWidth = 4; glow(g, COL.pink, 14);        // and this is how far
+    g.beginPath(); g.arc(cx, cy, R + 2, lo, Math.max(hi, lo + 0.12)); g.stroke(); noGlow(g);
+  }
+  g.strokeStyle = her ? COL.pink : "#e8f3ff"; g.lineWidth = her ? 2.5 : 2; if (her) glow(g, COL.pink, 8);
+  g.beginPath(); g.moveTo(cx, cy); g.lineTo(cx + Math.cos(av) * (R - 7), cy + Math.sin(av) * (R - 7)); g.stroke(); noGlow(g);
+}
+function kaiaBadge(slot, band, k) {
+  const el = qs(slot, `[data-kb="${band}"]`), knobEl = qs(slot, `[data-n="${band}"]`);
+  const on = k != null && Math.abs(k - 1) > 0.015;
+  if (el) { el.classList.toggle("on", on); if (on) el.textContent = k < 0.02 ? "K·KILL" : `K${(20 * Math.log10(k)).toFixed(1)}`; }
+  if (knobEl) knobEl.classList.toggle("herhand", on);
+}
+// The meters draw every animation frame (60 fps) on their own: they are four
+// small canvases, and at the booth's 30 fps a kick landed up to 33 ms late.
+function meterTick() {
+  if (!S || !S.live) return;
+  const m = meterLevels();
+  for (const slot of [1, 2]) {
+    const d = S.decks && S.decks[slot];
+    drawVU(qs(slot, '[data-k="vu"]'), d && d.state === "playing" ? m[slot] : -90, slot);
+  }
+  drawVU($("mvuL"), m.m, "mL"); drawVU($("mvuR"), m.m - 0.4, "mR");
+}
+function updateMixer() {
+  const ch = S.channels || {};
+  [1, 2].forEach((slot) => {
+    const d = S.decks && S.decks[slot], sounding = !!(d && d.state === "playing");
+    // A deck that is not sounding shows the hand's setting: the mix applies
+    // nothing to it, and its knobs read as cut to nothing otherwise.
+    const c = sounding ? (ch[slot] || { low: 1, mid: 1, high: 1, level: -90 }) : { low: 1, mid: 1, high: 1, level: -90 }, sh = shown[slot];
+    sh.low = smooth(sh.low, c.low, 0.35); sh.high = smooth(sh.high, c.high, 0.35);
+    const col = DECK[slot];
+    const trim = ctl(slot, "trim"), hi = ctl(slot, "high"), mid = ctl(slot, "mid"), lo = ctl(slot, "low"), fd = ctl(slot, "fader");
+    drawKnobV(qs(slot, '[data-k="trim"]'), (trim + 12) / 24, COL.purple, 0.5, null);
+    const kk = (sounding && c.kaia) || { low: 1, mid: 1, high: 1 };
+    sh.kh = smooth(sh.kh ?? 1, kk.high, 0.35); sh.km = smooth(sh.km ?? 1, kk.mid, 0.35); sh.kl = smooth(sh.kl ?? 1, kk.low, 0.35);
+    drawKnobV(qs(slot, '[data-k="high"]'), hi * sh.high / 1.5, col, 2 / 3, hi / 1.5, sh.kh);
+    sh.mid = smooth(sh.mid ?? 0, c.mid ?? c.high, 0.35);
+    drawKnobV(qs(slot, '[data-k="mid"]'), mid * sh.mid / 1.5, col, 2 / 3, mid / 1.5, sh.km);
+    kaiaBadge(slot, "high", sh.kh); kaiaBadge(slot, "mid", sh.km); kaiaBadge(slot, "low", sh.kl);
+    const kill = (sh.low < 0.05 || lo < 0.05) && d && d.state === "playing";
+    drawKnobV(qs(slot, '[data-k="low"]'), lo * sh.low / 1.5, kill ? COL.red : col, 2 / 3, lo / 1.5, sh.kl);
+    const ll = qs(slot, '[data-k="lowlbl"]'); ll.textContent = kill ? "KILL" : "LOW"; ll.style.color = kill ? COL.red : "";
+    for (const n of ["trim", "high", "mid", "low"]) qs(slot, `[data-n="${n}"]`).classList.toggle("touched", ctl(slot, n) !== FLAT[n]);
+    drawFader(qs(slot, '[data-k="fader"]'), fd, fd < 1 ? COL.yellow : col);
+  });
+  const mv = ctl(0, "master");
+  drawKnobV($("mknob"), mv / 1.5, mv !== 1 ? COL.yellow : COL.green, 2 / 3, null);
+  drawKnobV($("phknob"), phonesVol, COL.cyan, 0, null);
+  // crossfader: the hand's position if it has one, else where the automix sits
+  const hand = ctl(0, "xfader");
+  const g1 = Math.max(shown[1].low, shown[1].high), g2 = Math.max(shown[2].low, shown[2].high);
+  const autoX = g1 + g2 > 0.01 ? g2 / (g1 + g2) : 0.5;
+  const xv = hand === null || hand === undefined ? autoX : hand;
+  const [g, W, H] = fit($("xf")); g.clearRect(0, 0, W, H);
+  g.fillStyle = "rgba(0,0,0,.6)"; g.fillRect(10, H / 2 - 2, W - 20, 4);
+  const grd = g.createLinearGradient(10, 0, W - 10, 0); grd.addColorStop(0, COL.cyan); grd.addColorStop(1, COL.pink);
+  g.fillStyle = grd; g.globalAlpha = .35; g.fillRect(10, H / 2 - 1, W - 20, 2); g.globalAlpha = 1;
+  const x = 10 + (W - 20) * xv;
+  g.fillStyle = hand === null || hand === undefined ? "#1a2440" : "#2a1f10"; g.fillRect(x - 14, 4, 28, H - 8);
+  const xc = hand === null || hand === undefined ? (xv < 0.5 ? COL.cyan : COL.pink) : COL.yellow;
+  g.fillStyle = xc; glow(g, xc, 12); g.fillRect(x - 1, 6, 2, H - 12); noGlow(g);
+  if (hand !== null && hand !== undefined) { g.fillStyle = COL.yellow; g.font = "600 8px JetBrains Mono"; g.fillText("HAND", x > W - 60 ? x - 42 : x + 16, 12); }
+  const c = S.controls;
+  const touched = c && (c.xfader !== null || c.master !== 1 || Object.values(c.channels).some((v) => Object.keys(FLAT).some((k) => v[k] !== FLAT[k]))) || (S.paused || []).length;
+  $("auto").classList.toggle("hot", !!touched);
+  // the transition
+  const mix = S.mix, kind = $("fxkind"), count = $("fxcount"), why = $("fxwhy");
+  const [pg, PW, PH] = fit($("prog")); pg.clearRect(0, 0, PW, PH);
+  if (mix) {
+    const t = mixNow(), bar = 4 * mix.beat;
+    kind.textContent = mix.kind === "cut" ? "SWITCH" : mix.kind === "echo" ? "ECHO-OUT" : mix.kind.toUpperCase(); kind.className = "kind " + mix.kind;
+    const r = mix.ramp || mix.length / 4, swap = mix.drop + mix.length / 2;
+    const rideAt = mix.drop + 2 * r, outAt = mix.done - 2 * r, highsOut = mix.done - r;
+    const bars = (x) => `${((x - t) / bar).toFixed(1)} BARS`;
+    if (mix.kind === "out") count.textContent = t < mix.drop ? `FADE-OUT IN ${bars(mix.drop)}` : `FINISHING · ${bars(mix.done)}`;
+    else if (t < mix.drop) count.textContent = `${mix.kind === "blend" ? "DROP" : mix.kind === "fade" ? "FADE" : mix.kind === "echo" ? "ECHO-OUT" : "SWITCH"} IN ${bars(mix.drop)}`;
+    else if (mix.kind === "fade" && t < mix.done) count.textContent = `CROSSFADING · ${bars(mix.done)}`;
+    else if (mix.kind === "blend" && t < rideAt) count.textContent = `COMING IN · RIDE IN ${bars(rideAt)}`;
+    else if (mix.kind === "blend" && t < swap) count.textContent = `RIDING · BASS SWAP IN ${bars(swap)}`;
+    else if (mix.kind === "blend" && t < outAt) count.textContent = `RIDING · OUT IN ${bars(outAt)}`;
+    else if (mix.kind === "blend" && t < mix.done) count.textContent = `GOING OUT · ${bars(mix.done)}`;
+    else count.textContent = "HANDING OVER";
+    why.textContent = mix.kind === "blend"
+      ? `${mix.mode === "skip" ? "skip" : "end of record"} · ${Math.round(mix.length / mix.beat)} beats · stretch ×${mix.ratio.toFixed(4)} · ch ${mix.out_slot} → ch ${mix.in_slot}`
+      : mix.kind === "echo"
+      ? `${mix.mode === "skip" ? "skip" : "end of record"} · echo-out on the bar · ${mix.why || "no common beat"}`
+      : `${mix.mode === "skip" ? "skip" : "end of record"} · ${Math.round(mix.length / mix.beat)} beats · ${mix.why || "clean cut on the bar"}`;
+    const t0 = mix.start, t3 = mix.done, span = Math.max(0.01, t3 - t0), X = (v) => (v - t0) / span * PW;
+    const segs = mix.kind === "blend"
+      ? [[t0, mix.drop, COL.faint, ""], [mix.drop, rideAt, COL.cyan, "IN"], [rideAt, swap, COL.green, "RIDE"],
+         [swap, outAt, COL.yellow, "BASS SWAPPED"], [outAt, mix.done, COL.pink, "OUT"]]
+      : mix.kind === "fade"
+      ? [[t0, mix.drop, COL.faint, ""], [mix.drop, mix.drop + mix.length / 2, COL.purple, "CROSSFADE"], [mix.drop + mix.length / 2, mix.done, COL.pink, "BASS · OUT"]]
+      : mix.kind === "out"
+      ? [[t0, mix.drop + 0.001, COL.faint, ""], [mix.drop, mix.done, COL.pink, `KAIA FADES CH ${mix.out_slot} OUT`]]
+      : mix.kind === "echo"
+      ? [[t0, mix.drop, COL.faint, ""], [mix.drop, mix.done + 0.001, COL.purple, "ECHO-OUT"]]
+      : [[t0, mix.drop, COL.yellow, "CUT"]];
+    pg.font = "600 8px JetBrains Mono";
+    for (const [a, b, col, lbl] of segs) {
+      pg.fillStyle = "rgba(42,53,84,.6)"; pg.fillRect(X(a) + 1, 4, X(b) - X(a) - 2, PH - 8);
+      const fill = Math.max(0, Math.min(1, (t - a) / Math.max(0.001, b - a)));
+      pg.fillStyle = col; glow(pg, col, 6); pg.fillRect(X(a) + 1, 4, (X(b) - X(a) - 2) * fill, PH - 8); noGlow(pg);
+      pg.fillStyle = "#e8f3ff"; pg.fillText(lbl, X(a) + 5, PH / 2 + 3);
+    }
+  } else if (handDeck()) {
+    const h = handDeck(), air = S.on_air;
+    kind.textContent = "HANDS"; kind.className = "kind cut";
+    count.textContent = h.state === "cued" ? "STARTING ON THE BEAT" : S.handover > 0 ? `HANDOVER IN ${Math.max(0, 2 - S.handover).toFixed(1)} s` : "BOTH DECKS OPEN";
+    why.textContent = `deck ${h.slot} ${h.synced ? "synced" : "unsynced"} · ch ${air} down to hand over`;
+    why.title = `pull channel ${air}'s fader down, or the crossfader across, and deck ${h.slot} takes over after 2 s — or press the button and kaia finishes the mix`;
+  } else if (S.planning) {
+    kind.textContent = "SYNCING"; kind.className = "kind plan"; count.textContent = ""; why.textContent = `finding the bar · ${S.planning}`;
+  } else {
+    kind.textContent = "—"; kind.className = "kind"; count.textContent = ""; why.textContent = "no transition planned";
+  }
+  const lb = local["0:blend"], beats = lb && performance.now() < lb.until ? lb.v : S.mix_beats;
+  document.querySelectorAll("#blendsel [data-beats]").forEach((x) => x.classList.toggle("on", +x.dataset.beats === beats));
+  const lr = local["0:rides"]; $("rides").classList.toggle("on", lr && performance.now() < lr.until ? lr.v : !!S.rides);
+  const md = masterDeck(); $("blendsec").textContent = md && md.tempo ? `≈ ${Math.round(beats * 60 / md.tempo)} s` : "";
+  // One button, one name; the line under it says what pressing it does now.
+  const fd = S.decks && S.decks[S.free];
+  const title = (d) => (d && (d.title || d.name)) || "the next record";
+  const inDeck = mix && S.decks ? S.decks[mix.in_slot] : null;
+  const barsTo = (x) => mix && mix.beat ? Math.max(0, Math.round((x - mixNow()) / (4 * mix.beat))) : 0;
+  const how = (k) => k === "blend" ? "beat-matched blend" : k === "out" ? "kaia finishing your mix" : "clean switch on the bar (the beats can't be matched)";
+  let live = true, hint = `NEXT: kaia brings in ${title(fd)} on the next phrase`;
+  if (performance.now() < skipLock) { live = false; hint = "on it…"; }
+  else if (mix && mix.started) { live = false; hint = `${how(mix.kind)} into ${title(inDeck)} — ${barsTo(mix.done)} bars to go`; }
+  else if (mix) hint = `${how(mix.kind)} into ${title(inDeck)} in ${barsTo(mix.drop)} bars — NEXT starts it now`;
+  else if (handDeck()) hint = `NEXT: kaia takes over and finishes your mix into ${title(handDeck())}`;
+  else if (S.planning) { live = false; hint = `lining up ${title(fd)}…`; }
+  const label = mix && mix.started ? "MIXING…" : "NEXT ▸▸";
+  if ($("skiphint").textContent !== hint) $("skiphint").textContent = hint;
+  $("skip").disabled = !live; if ($("skip").textContent !== label) $("skip").textContent = label;
+}
+
+// ── the rest of the booth ────────────────────────────────────────
+let lastListSig = "";
+function updateBottom() {
+  const names = S.names || [], hist = S.history || [];
+  const sig = names.join("|") + hist.length;
+  if (sig !== lastListSig) {
+    lastListSig = sig;
+    const byTo = {}; for (const h of hist) byTo[h.to] = h;
+    $("setlist").innerHTML = names.map((n, i) => {
+      const h = byTo[n]; const isNow = i === names.length - 1;
+      return `<li class="${isNow ? "now" : ""}"><span class="n">${String(i + 1).padStart(2, "0")}</span><span class="nm">${esc(n)}</span>${h ? `<span class="tk ${h.kind}">${h.kind.toUpperCase()}</span>` : ""}</li>`;
+    }).join("");
+  }
+  // next: the deck not playing out
+  const mix = S.mix, cur = S.decks && S.decks[S.on_air];
+  const nxt = S.decks && S.decks[S.free];
+  $("nxt-title").textContent = S.loading ? "LOADING " + S.loading.toUpperCase() : !nxt ? "CHOOSING THE NEXT RECORD" : mix ? "MIXING IN"
+    : handDeck() ? `DECK ${S.free} · PLAYING BY HAND` : nxt.hand ? `DECK ${S.free} · LOADED BY HAND` : nxt.state === "planning" ? "LINING UP" : "NEXT IN THE CRATE";
+  if (nxt) {
+    $("nxt-t").textContent = nxt.title || nxt.name; $("nxt-a").textContent = nxt.artist || "";
+    const chips = [];
+    if (cur) { const ck = cur.key_now || cur.key, nk = nxt.key_now || nxt.key, [kr, cls] = keyRelation(ck, nk);
+      chips.push(`<span class="chip ${cls}"><i>KEY</i>${ck || "?"} → ${nk || "?"} · ${kr}${nxt.semitones ? " (synced)" : ""}</span>`); }
+    if (cur && cur.tempo && nxt.bpm) { const pct = (cur.tempo / nxt.bpm - 1) * 100; chips.push(`<span class="chip ${Math.abs(pct) < 3 ? "good" : Math.abs(pct) < 6 ? "ok" : "bad"}"><i>TEMPO</i>${nxt.bpm} → ${cur.tempo.toFixed(1)} (${pct >= 0 ? "+" : ""}${pct.toFixed(1)}%)</span>`); }
+    if (nxt.grid) chips.push(`<span class="chip ${nxt.grid.contrast >= 4 && nxt.grid.bar_known ? "good" : "ok"}"><i>BEAT</i>${nxt.grid.contrast >= 4 ? "steady" : "loose"} ${nxt.grid.contrast.toFixed(1)}${nxt.grid.bar_known ? " · bar 1 at " + nxt.grid.downbeat.toFixed(2) + "s" : ""}</span>`);
+    if (nxt.bass_in != null && nxt.grid) chips.push(`<span class="chip"><i>BASS IN</i>bar ${Math.round((nxt.bass_in - nxt.grid.downbeat) / (240 / nxt.grid.bpm)) + 1} · ${fmt(nxt.bass_in)}</span>`);
+    if (nxt.genre) chips.push(`<span class="chip"><i>GENRE</i>${esc(nxt.genre)}</span>`);
+    chips.push(`<span class="chip"><i>LENGTH</i>${fmt(nxt.length)}</span>`);
+    $("nxt-chips").innerHTML = chips.join("");
+  } else { $("nxt-t").textContent = "choosing…"; $("nxt-a").textContent = ""; $("nxt-chips").innerHTML = ""; }
+  // kaia
+  const m = S.mood || {};
+  const rows = [["AROUSAL", m.arousal, COL.pink], ["ENERGY", m.energy, COL.green], ["VALENCE", m.valence != null ? (m.valence + 1) / 2 : null, COL.cyan]];
+  $("mood").innerHTML = rows.map(([k, v, c]) => `<span>${k}</span><div class="bar"><i style="width:${v == null ? 0 : Math.round(Math.max(0, Math.min(1, v)) * 100)}%;background:${c};box-shadow:0 0 8px ${c}"></i></div><span class="val">${v == null ? "—" : v.toFixed(2)}</span>`).join("");
+  const last = hist[hist.length - 1];
+  $("say").textContent = mix ? (mix.kind === "blend" ? `bringing ${S.decks[mix.in_slot] ? (S.decks[mix.in_slot].title || "the next one") : "the next one"} in on the bar, bass swap halfway.` : mix.kind === "fade" ? `fading the next one in over ${Math.round(mix.length / mix.beat / 4)} bars — ${mix.why || "the beats won't lock"}.` : mix.kind === "echo" ? `echoing this one out on the bar, the next one in under the repeats — ${mix.why || "the beats won't lock"}.` : `switching to the next one on the bar, no overlap — ${mix.why || "the beats won't lock"}.`)
+    : last ? `last move: ${last.kind} into ${last.to}${last.why ? " (" + last.why + ")" : ""}.` : `opened the set for ${S.by || "the room"}.`;
+  if (S.gesture) $("say").textContent = S.gesture + (mix ? " · " + $("say").textContent : "");
+  $("earlist").textContent = (S.listeners || []).length ? "in the room: " + S.listeners.join(", ") : "nobody in the room";
+  renderFeed();
+  kaiaAvatar(m, mix);
+}
+// ── her codec avatar (the shared engine at /kaia/): mood readings on her face,
+// her eyes on the deck she's bringing in, her pulse on the tempo ──
+const kaiaBooth = { codec: null, said: "", fed: 0 };
+KaiaAnimator.registerMood("BoothSet", { glow: 1.25, flowSpeed: 1.5, conduit: 0.8, bloom: 0.7, energy: 1.1, saccade: 0.8 });
+KaiaAnimator.registerMood("BoothIdle", { lid: 0.5, gazeY: 0.2, pitch: 0.25, glow: 0.3, flowSpeed: 0.4, brightness: 0.8, conduit: 0.2, energy: 0.4, pulseRate: 0.6 });
+// A different portrait of her on every launch (`portrait: "random"` in the
+// engine never repeats the last one); the page reloads when the server counts
+// a new launch, since the window is often reused rather than reopened.
+var kaiaLaunch = null;
+function kaiaRelaunch(n) {
+  if (n == null) return;
+  if (kaiaLaunch === null) kaiaLaunch = n;
+  else if (n !== kaiaLaunch) location.reload();
+}
+KaiaCodec.mount($("kaia-stage"), { assets: "/kaia/portraits", portrait: "random", maxFps: 30 })
+  .then((c) => { kaiaBooth.codec = c; }).catch((e) => console.error("[booth] Kaia:", e));
+window.KaiaBooth = { react: (kind) => kaiaBooth.codec && kaiaBooth.codec.react(kind) };
+$("kaialog").onclick = () => { const on = !$("kaiadetail").classList.contains("on"); $("kaiadetail").classList.toggle("on", on); $("kaialog").classList.toggle("on", on); };
+function kaiaAvatar(m, mix) {
+  const c = kaiaBooth.codec; if (!c) return;
+  const playing = S && S.decks && Object.values(S.decks).some((d) => d && d.state === "playing");
+  c.setMood(playing ? "BoothSet" : "BoothIdle");
+  const v = m.valence ?? 0, a = m.arousal ?? 0.5, e = m.energy ?? 0.5;
+  c.animator.setOffsets({
+    smile: 0.65 * v, squint: 0.35 * Math.max(0, v), browInner: 0.5 * Math.max(0, -v),
+    wide: 0.45 * (a - 0.5), browRaise: 0.3 * (a - 0.5), glow: 0.7 * (a - 0.5),
+    flowSpeed: 2 * (e - 0.5), conduit: 0.6 * (e - 0.5),
+  });
+  const md = masterDeck(); if (md && md.tempo) c.animator.setBehavior({ pulseRate: Math.min(3, md.tempo / 60) });
+  if (mix && mix.started && mix.in_slot) c.animator.lookAt(mix.in_slot === 1 ? -0.55 : 0.55, 0.15, 1.0);   // deck 1 left, deck 2 right
+  const line = $("say").textContent;
+  const newest = (S.chatter || []).reduce((t, l) => Math.max(t, l.ts || 0), 0);
+  if (line !== kaiaBooth.said || newest > kaiaBooth.fed) {
+    kaiaBooth.said = line; kaiaBooth.fed = newest;
+    c.speak(line);
+  }
+}
+
+// ── her feed: the server's lines (her decisions) and the page's (the timeline) ──
+const localFeed = [];
+let feedSig = "";
+function feedSay(text, kind) { localFeed.push({ ts: Date.now() / 1000, text, kind, local: true }); if (localFeed.length > 30) localFeed.shift(); }
+function renderFeed() {
+  const lines = [...(S.chatter || []).map((l) => ({ ...l, kind: l.kind === "plan" && /switch|cut/.test(l.text) ? "switch" : l.kind })), ...localFeed]
+    .sort((a, b) => a.ts - b.ts).slice(-12);
+  const now = Date.now() / 1000;
+  const sig = lines.map((l) => l.ts + l.text).join("|") + Math.floor(now / 10);
+  if (sig === feedSig) return;
+  feedSig = sig;
+  $("feed").innerHTML = lines.map((l) => {
+    const d = new Date(l.ts * 1000), hm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+    return `<div class="ln ${l.kind || ""}${now - l.ts < 8 ? " fresh" : ""}"><b>${hm}</b><span>${esc(l.text)}</span></div>`;
+  }).join("");
+}
+// ── the crate ────────────────────────────────────────────────────
+let crateData = null, crateShut = new Set(), crateSig = "", crateStatusSig = "", crateMode = "crate";
+const MATCH_GROUPS = ["BLENDS · IN KEY", "BLENDS · KEY CHANGE", "SWITCH ONLY · TEMPO TOO FAR", "NO TEMPO KNOWN"];
+const KEY_WEIGHT = [1, 0.9, 0.9, 0.6, 0.3];        // same, ±1, relative, ±2 (energy), anything else
+function relation(a, b) {
+  const x = camelot(a), y = camelot(b); if (!x || !y) return 4;
+  if (x[0] === y[0] && x[1] === y[1]) return 0;
+  const d = ((y[0] - x[0]) % 12 + 12) % 12;
+  if (x[1] === y[1] && (d === 1 || d === 11)) return 1;
+  if (x[0] === y[0]) return 2;
+  if (x[1] === y[1] && (d === 2 || d === 10)) return 3;
+  return 4;
+}
+function tempoGap(playing, bpm) {      // the stretch it would take, half and double time counted
+  if (!playing || !bpm) return null;
+  return Math.min(...[bpm, bpm * 2, bpm / 2].map((b) => Math.abs(playing / b - 1)));
+}
+// How well a record would mix into the one on air, 0–100: key (by the Camelot
+// wheel) times tempo (full at the same tempo, half at the 6% stretch limit).
+// Past 6% it cannot be beat-matched at all and is only ever faded: null.
+function mixScore(md, r) {
+  const gap = tempoGap(md && md.tempo, r.bpm);
+  if (gap === null || gap > 0.06) return null;
+  const [rel, st] = keyRel(md, r);
+  return Math.round(100 * (st ? 0.8 : KEY_WEIGHT[rel]) * (1 - 0.5 * gap / 0.06));
+}
+function masterDeck() {          // the record on air, in the key it is sounding in
+  const d = S && S.decks && S.decks[S.on_air];
+  return d ? { ...d, key: d.key_now || d.key } : null;
+}
+function shiftKey(k, st) { const c = camelot(k); return c ? `${((c[0] - 1 + 7 * st) % 12 + 12) % 12 + 1}${c[1]}` : k; }
+// Key sync can move a clashing record a semitone to fit: it then counts nearly as in key.
+function keyRel(md, r) {
+  const rel = relation(md.key, r.key);
+  if (rel <= 2 || !S.key_sync) return [rel, 0];
+  for (const st of [1, -1]) if (relation(md.key, shiftKey(r.key, st)) <= 2) return [rel, st];
+  return [rel, 0];
+}
+function loadCrate() {
+  fetch("/crate").then((r) => r.json()).then((c) => { c.stamp = Date.now(); crateData = c; renderCrate(); }).catch(() => {});
+}
+function crateIds() {
+  const air = masterDeck(), fd = S && S.decks && S.decks[S.free];
+  return { air: air ? air.id : null, free: fd ? fd.id : null };
+}
+function statusOf(r, ids) {
+  if (r.id === ids.air) return ["ON AIR", "now"];
+  if (r.id === ids.free) return [`DECK ${S.free}`, "loaded"];
+  if (r.requested) return ["NEXT", "req"];
+  if (r.played) return ["PLAYED", "played"];
+  return ["", ""];
+}
+function renderCrate() {
+  if (!crateData || !crateData.genres) return;
+  const qv = $("search").value.trim().toLowerCase();
+  const ids = crateIds();
+  const md = masterDeck();
+  // The list is rebuilt only when what it holds or its order changes (and a
+  // rebuild keeps its scroll); a record starting, loading or finishing only
+  // changes its row.
+  const sig = crateMode + "|" + qv + "|" + [...crateShut].join() + crateData.count
+    + "|" + (crateMode === "match" && md ? md.id + md.key + (md.tempo || 0).toFixed(1) : "");
+  const statusSig = ids.air + "|" + ids.free + "|" + crateData.stamp;
+  if (sig === crateSig) {
+    if (statusSig !== crateStatusSig) { crateStatusSig = statusSig; markCrate(ids); }
+    return;
+  }
+  const keepScroll = crateSig.split("|")[0] === crateMode ? $("cratepane").scrollTop : 0;
+  crateSig = sig; crateStatusSig = statusSig;
+  let html = "", shown = 0;
+  let groups = Object.entries(crateData.genres);
+  if (crateMode === "match") {
+    const all = groups.flatMap(([g, rows]) => rows.map((r) => ({ ...r, genre: g, score: md ? mixScore(md, r) : null })));
+    const buckets = MATCH_GROUPS.map(() => []);
+    for (const r of all) {
+      if (md && r.id === md.id) continue;
+      const gap = tempoGap(md && md.tempo, r.bpm);
+      const [rel, st] = keyRel(md, r); r.sync = st;
+      buckets[gap === null ? 3 : r.score === null ? 2 : rel <= 2 || st ? 0 : 1].push(r);
+    }
+    buckets[0].sort((a, c) => c.score - a.score); buckets[1].sort((a, c) => c.score - a.score);
+    buckets[2].sort((a, c) => relation(md.key, a.key) - relation(md.key, c.key) || tempoGap(md.tempo, a.bpm) - tempoGap(md.tempo, c.bpm));
+    groups = MATCH_GROUPS.map((name, i) => [md && i < 2 ? `${name} · ${md.key || "?"} @ ${md.tempo ? md.tempo.toFixed(1) : "?"}` : name, buckets[i]]);
+  }
+  for (const [genre, rows] of groups) {
+    const hit = rows.filter((r) => !qv || `${r.title} ${r.artist} ${genre} ${r.key} ${r.bpm}`.toLowerCase().includes(qv));
+    if (!hit.length) continue; shown += hit.length;
+    const shut = crateShut.has(genre) && !qv;
+    html += `<div class="genre${shut ? " shut" : ""}"><div class="gh" data-g="${esc(genre)}">${shut ? "▸" : "▾"} ${esc(genre.toUpperCase())}<span class="n">${hit.length}</span></div><div class="rows">` +
+      hit.map((r) => {
+        const [st, cls] = statusOf(r, ids);
+        let col = `<span class="bpm">${r.bpm ? r.bpm.toFixed(0) : "—"}</span>`;
+        if (crateMode === "match" && md && md.tempo && r.bpm) {
+          const gap = tempoGap(md.tempo, r.bpm), sc = r.score;
+          col = sc === null
+            ? `<span class="bpm fit" style="color:var(--dim)" title="${(gap * 100).toFixed(1)}% off ${md.tempo.toFixed(1)} bpm — past 6% it can only be switched to on the bar">SWITCH</span>`
+            : `<span class="bpm fit" style="color:${sc >= 70 ? "var(--green)" : sc >= 40 ? "var(--yellow)" : "var(--red)"}" title="mix score ${sc}/100: key ${md.key || "?"} → ${r.key || "?"}${r.sync ? ` (key sync ${r.sync > 0 ? "+1" : "−1"} semitone → ${shiftKey(r.key, r.sync)})` : ""}, stretch ${(gap * 100).toFixed(1)}% to ${md.tempo.toFixed(1)} bpm">MIX ${sc}</span>`;
+        }
+        return `<div class="trk ${cls}" data-id="${r.id}" title="load on the free deck">` +
+          `<span class="nm">${esc(r.title)}${r.artist ? ` <i>— ${esc(r.artist)}</i>` : ""}</span>` + col +
+          `<span class="key" style="background:${keyColor(r.key)}">${esc(r.key || "?")}</span><span class="st">${st}</span></div>`;
+      }).join("") + "</div></div>";
+  }
+  $("cratepane").innerHTML = html || `<div style="color:var(--dim);font-size:12px;padding:8px">nothing matches</div>`;
+  $("cratepane").scrollTop = keepScroll;
+  $("cratecount").textContent = `${shown} / ${crateData.count}`;
+  $("collapse").textContent = document.querySelector("#cratepane .genre:not(.shut)") ? "FOLD ALL" : "OPEN ALL";
+}
+function markCrate(ids) {
+  const byId = {};
+  for (const rows of Object.values(crateData.genres)) for (const r of rows) byId[r.id] = r;
+  for (const row of $("cratepane").querySelectorAll(".trk")) {
+    const r = byId[row.dataset.id]; if (!r) continue;
+    const [st, cls] = statusOf(r, ids);
+    for (const c of ["now", "loaded", "req", "played"]) row.classList.toggle(c, c === cls);
+    const cell = row.querySelector(".st"); if (cell.textContent !== st) cell.textContent = st;
+  }
+}
+$("cratepane").addEventListener("click", (e) => {
+  const gh = e.target.closest(".gh");
+  if (gh) { const g = gh.dataset.g; crateShut.has(g) ? crateShut.delete(g) : crateShut.add(g); crateSig = ""; renderCrate(); return; }
+  const row = e.target.closest(".trk");
+  if (!row) return;
+  const name = row.querySelector(".nm").textContent;
+  if (row.dataset.id === crateIds().air) { toast("that one's on air"); return; }
+  post("/load", { id: row.dataset.id }).then((r) => {
+    if (!r) { toast(`load request failed for ${name}`); return; }
+    toast(`loading ${name} on deck ${S ? S.free : ""}…`);
+    setTimeout(loadCrate, 2500);
+  });
+});
+$("collapse").addEventListener("click", () => {
+  const heads = [...document.querySelectorAll("#cratepane .gh")].map((h) => h.dataset.g);
+  const anyOpen = document.querySelector("#cratepane .genre:not(.shut)");
+  if (anyOpen) heads.forEach((g) => crateShut.add(g)); else crateShut.clear();
+  crateSig = ""; renderCrate();
+});
+$("search").addEventListener("input", () => renderCrate());
+document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () => {
+  document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("on", x === t));
+  const tab = t.dataset.tab, crate = tab === "crate" || tab === "match";
+  if (crate) { crateMode = tab; crateSig = ""; renderCrate(); }
+  $("cratepane").style.display = crate ? "" : "none"; $("search").style.display = crate ? "" : "none";
+  $("setpane").style.display = tab === "set" ? "block" : "none";
+  $("setspane").style.display = tab === "sets" ? "block" : "none";
+  $("collapse").style.display = crate ? "" : "none";
+  setsOn = tab === "sets"; if (setsOn) loadSets();
+}));
+// ── SETS: Kaia's pre-measured sets ────────────────────────────────────
+let setsOn = false, setsData = null, setsSig = "", setsOpen = new Set();
+function loadSets() {
+  fetch("/sets").then((r) => r.json()).then((d) => { setsData = d; renderSets(); }).catch(() => {});
+}
+function renderSets() {
+  const d = setsData; if (!d) return;
+  const sig = JSON.stringify(d.sets.map((x) => [x.playing, x.tracks.map((t) => +t.played + 2 * t.on_air)])) + d.next + [...setsOpen].join();
+  if (sig === setsSig) return;
+  setsSig = sig;
+  const keep = $("setspane").scrollTop;
+  if (!d.sets.length) {
+    $("setspane").innerHTML = `<div style="color:var(--dim);font-size:12px;padding:8px">${d.building
+      ? "measuring which records lock with which — the sets appear when it's done"
+      : "no sets yet — they're built from records measured to lock together"}</div>`;
+    $("cratecount").textContent = ""; return;
+  }
+  $("setspane").innerHTML = d.sets.map((x) => {
+    const open = setsOpen.has(x.i) || (x.playing && !setsOpen.has(-1 - x.i));
+    const done = x.tracks.filter((t) => t.played).length;
+    const tag = x.playing ? `<span class="tag now">NOW · ${done}/${x.tracks.length}</span>`
+      : x.i === d.next ? `<span class="tag up" title="the next !music records starts this one">NEXT UP</span>` : "";
+    const bpm = x.bpm ? (Math.round(x.bpm[0]) === Math.round(x.bpm[1]) ? `${Math.round(x.bpm[0])}` : `${Math.round(x.bpm[0])}–${Math.round(x.bpm[1])}`) : "?";
+    return `<div class="genre mset${open ? "" : " shut"}${x.playing ? " playing" : ""}">` +
+      `<div class="gh" data-set="${x.i}">${open ? "▾" : "▸"} SET ${x.i + 1} ${tag}` +
+      `<span class="meta">${x.tracks.length} · ${bpm} BPM · ${esc(x.keys[0] || "?")} → ${esc(x.keys[1] || "?")} · ${esc(x.tracks[0].title)}</span>` +
+      `<span class="play" data-play="${x.i}" title="follow this set from here: its first record comes in next">${x.playing ? "▶ PLAYING" : "▶ PLAY"}</span></div>` +
+      `<div class="rows">` + x.tracks.map((t, k) => {
+        const [st, cls] = t.on_air ? ["ON AIR", "now"] : t.played ? ["PLAYED", "played"] : ["", ""];
+        return `<div class="trk ${cls}" data-id="${t.id}" title="load on the free deck">` +
+          `<span class="nm"><span class="pos">${k + 1}</span>${esc(t.title)}${t.artist ? ` <i>— ${esc(t.artist)}</i>` : ""}</span>` +
+          `<span class="bpm">${t.bpm ? t.bpm.toFixed(0) : "—"}</span><span class="key" style="background:${keyColor(t.key)}">${esc(t.key || "?")}</span><span class="st">${st}</span></div>`;
+      }).join("") + `</div></div>`;
+  }).join("");
+  $("setspane").scrollTop = keep;
+  $("cratecount").textContent = `${d.sets.length} sets`;
+}
+$("setspane").addEventListener("click", (e) => {
+  const play = e.target.closest("[data-play]");
+  if (play) {
+    const i = +play.dataset.play;
+    post("/set", { i }).then((r) => (r && r.ok ? r.json() : Promise.reject())).then((j) => { toast(j.on_air ? `set ${i + 1}: ${j.next} is already on air — following set ${i + 1} from here`
+                                          : `set ${i + 1}: ${j.next} comes in next`); setTimeout(loadSets, 600); })
+      .catch(() => toast("that set couldn't be started"));
+    return;
+  }
+  const gh = e.target.closest(".gh");
+  if (gh) {
+    const i = +gh.dataset.set, x = setsData.sets[i];
+    const open = !gh.parentElement.classList.contains("shut");
+    if (open) { setsOpen.delete(i); if (x.playing) setsOpen.add(-1 - i); } else { setsOpen.add(i); setsOpen.delete(-1 - i); }
+    setsSig = ""; renderSets(); return;
+  }
+  const row = e.target.closest(".trk");
+  if (!row) return;
+  if (row.classList.contains("now")) { toast("that one's on air"); return; }
+  const name = row.querySelector(".nm").textContent.replace(/^\d+/, "");
+  post("/load", { id: row.dataset.id }).then((r) => {
+    if (!r) { toast(`load request failed for ${name}`); return; }
+    toast(`loading ${name} on deck ${S ? S.free : ""}…`);
+  });
+});
+setInterval(() => { if (setsOn) loadSets(); }, 4000);
+// What a load came to, said once.
+let loadSeen = 0;
+function loadNews() {
+  const l = S && S.last_load; if (!l || l.ts <= loadSeen) return;
+  const first = !loadSeen; loadSeen = l.ts; if (first && Date.now() / 1000 - l.ts > 5) return;
+  const msg = { loaded: `${l.name} on deck ${S.free} — drag to cue, ▶ to play it yourself, or NEXT and kaia mixes it in`,
+    after: `${l.name} comes after this blend (kaia's mid-mix on that deck)`,
+    busy: `deck ${S.free} is playing and up on its fader — pause it or pull it down first`,
+    unreadable: `${l.name} couldn't be read` }[l.result] || `${l.name}: ${l.result}`;
+  toast(msg);
+}
+setInterval(loadCrate, 10000);
+
+function esc(s) { return String(s || "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+function updateHeader() {
+  const d = new Date(); $("clock").textContent = d.toTimeString().slice(0, 8);
+  const live = S && S.live; $("idle").classList.toggle("show", !live); $("livedot").classList.toggle("live", !!live);
+  if (!live) return;
+  $("chan").textContent = "#" + (S.channel || "voice");
+  $("uptime").textContent = fmt(Date.now() / 1000 - S.started);
+  $("played").textContent = S.played; $("ears").textContent = (S.listeners || []).length;
+  const late = S.late || { count: 0 };
+  $("voice").textContent = late.count ? `LATE ×${late.count} · ${late.worst_ms}ms` : "CLEAN";
+  $("voice").style.color = late.count ? COL.yellow : COL.green;
+}
+
+// 30 frames a second: the mixer's state arrives at 20, and every frame
+// redraws some thirty canvases — at 60 the compositor alone took a core.
+const FRAME_MS = 1000 / 30;
+let lastFrame = 0;
+function showDelay() { $("mdelay").textContent = `METERS +${meterDelay} ms`; }
+$("mdelay").addEventListener("click", () => {
+  meterDelay = METER_DELAYS[(METER_DELAYS.indexOf(meterDelay) + 1) % METER_DELAYS.length];
+  try { localStorage.setItem("kaia.meterDelay", String(meterDelay)); } catch (_) {}
+  showDelay(); toast(`meters ${meterDelay} ms behind the mixer — to match what you hear in Discord`);
+});
+showDelay();
+function frame(ts) {
+  try { meterTick(); } catch (e) { console.error(e); }
+  if (ts - lastFrame < FRAME_MS - 2) { requestAnimationFrame(frame); return; }
+  lastFrame = ts;
+  try {
+    updateHeader();
+    if (S && S.live) { drawLanes(); updateDeck(1); updateDeck(2); updateMixer(); updateBottom(); renderCrate(); loadNews(); phonesTick(1); phonesTick(2); }
+    else { phonesTick(1); phonesTick(2); }
+  } catch (e) { console.error(e); }
+  requestAnimationFrame(frame);
+}
+connect();
+loadCrate();
+requestAnimationFrame(frame);
+
+// ── FX ─────────────────────────────────────────────────────────────────
+// Everything here reads the mixer's real state: the beat of the record on air,
+// the master level and band gains, Kaia's own hands on the knobs, and what
+// each transition was measured to be. A locked blend builds the aura and the
+// combo; a switch because nothing locked, or a dropped voice frame, is red.
+const FX = (() => {
+  const bg = $("fxbg"), top = $("fxtop");
+  let on = true, W = 0, H = 0, dpr = 1;
+  try { const v = localStorage.getItem("kaia.fx"); on = v === null ? !matchMedia("(prefers-reduced-motion: reduce)").matches : v === "1"; } catch (_) {}
+  const parts = [], pops = [], reticles = new Map(), knobPos = new WeakMap();
+  let lastDrop = -99, seeded = false, heat = 0, lastGesture = "", lastGestureSay = -99, started = false;
+  const embers = [];
+  // How far the set has built: 0 at the start, rising with each locked blend
+  // in a row and easing toward it, so the stage grows over a set and a clash
+  // takes it back down.
+  const tierOf = (c) => 1 - Math.exp(-c / 5);
+  const pickOne = (a) => a[Math.floor(Math.random() * a.length)];
+  let aura = 0, combo = 0, red = 0, flash = 0, lastLate = null, lastMix = null, swapped = false, lastBeat = -1, kick = 0;
+  function size() {
+    dpr = Math.min(window.devicePixelRatio || 1, 1.5); W = innerWidth; H = innerHeight;
+    for (const c of [bg, top]) { c.width = W * dpr; c.height = H * dpr; c.style.width = W + "px"; c.style.height = H + "px"; }
+  }
+  addEventListener("resize", size); size();
+  function setOn(v) {
+    on = v; document.body.classList.toggle("fx", on); $("fxbtn").classList.toggle("on", on); $("fxstate").textContent = on ? "ON" : "OFF";
+    try { localStorage.setItem("kaia.fx", on ? "1" : "0"); } catch (_) {}
+  }
+  $("fxbtn").addEventListener("click", () => setOn(!on)); setOn(on);
+  function pop(text, color, big) { pops.push({ text, color, t: performance.now() / 1000, big: !!big }); if (pops.length > 6) pops.shift(); }
+  function bad(text) {
+    if (window.KaiaBooth) window.KaiaBooth.react("alert");
+    red = 1; combo = 0; aura *= 0.35; pop(text, COL.red, true);
+    document.body.classList.remove("shake"); void document.body.offsetWidth; document.body.classList.add("shake");
+  }
+  // what happened in the mix, from the stream
+  function events() {
+    const m = S && S.live ? S.mix : null, late = S && S.late ? S.late.count : 0;
+    if (lastLate !== null && late > lastLate) {                // a late voice frame: once in 8 s, then just a pulse
+      const now = performance.now() / 1000;
+      if (now - lastDrop > 8) { lastDrop = now; bad("DROPOUT"); feedSay(pickOne(["something stuttered — that was the machine, not the mix.", "a frame came late. i heard it too.", "hiccup in the audio. the busywork waits till we're done."]), "bad"); }
+      else red = Math.max(red, 0.35);
+    }
+    lastLate = late;
+    // The combo is the set's own: rebuilt once from its history (a reopened
+    // page keeps it), the trailing run of blends with no switch among them.
+    if (!seeded && S && S.live && S.history) {
+      seeded = true; let n = 0;
+      const hist = S.history.slice(0, m ? -1 : undefined);
+      // An echo-out neither adds to the run nor breaks it: it is a clean move, not a blend.
+      for (let i = hist.length - 1; i >= 0 && (hist[i].kind === "blend" || hist[i].kind === "echo"); i--) if (hist[i].kind === "blend") n++;
+      combo = n; heat = tierOf(combo);
+    }
+    if (S && S.gesture && S.gesture !== lastGesture) {
+      lastGesture = S.gesture; const now = performance.now() / 1000;
+      if (now - lastGestureSay > 25) { lastGestureSay = now; feedSay(S.gesture + ".", "hands"); }
+    }
+    const key = m ? `${m.kind}|${m.drop}|${m.mode}` : "";
+    const was = lastMix;
+    if (m && (!was || was.key !== key)) {
+      swapped = false;
+      if (m.kind === "blend") pop(/moved/.test(m.check || "") ? "LOCKED · NUDGED" : "LOCKED", COL.cyan);
+      else if (m.kind === "echo") pop("ECHO OUT", COL.purple);
+      else if (m.fallback === "unlocked") bad("NO LOCK · SWITCH");
+      else if (m.kind === "cut") pop("SWITCH", COL.yellow);
+    }
+    if (m && m.kind === "blend" && m.started) {
+      aura = Math.min(1, aura + 0.0025);
+      const md = masterDeck();
+      const now = m.now + (S ? since() : 0);
+      if (!started) { started = true; feedSay(pickOne(["both records up now. riding it.", "the new one's in on top. holding them together.", "two grooves, one pulse. this is the good part."]), "plan"); }
+      if (!swapped && now >= m.drop + m.length / 2) { swapped = true; flash = 1; pop("BASS SWAP", COL.green);
+        feedSay(pickOne(["bass handed over.", "swapped the low end on the bar.", "new bassline in, old one out."]), "plan"); }
+    }
+    if (!m && was && was.kind === "blend" && was.started) {
+      combo += 1; flash = Math.max(flash, 0.8); pop(combo > 1 ? `PERFECT BLEND ×${combo}` : "PERFECT BLEND", COL.green, true); aura = Math.min(1, aura + 0.25);
+      if (window.KaiaBooth) window.KaiaBooth.react("capture");
+      if (combo > 1 && combo % 3 === 0) feedSay(pickOne([`${combo} locked in a row.`, `that's ${combo} without a seam.`, `${combo} straight. the room's warming up.`]), "set");
+    }
+    if (m && (!was || was.key !== key)) started = false;
+    lastMix = m ? { key, kind: m.kind, started: m.started } : null;
+  }
+  // ── scenes: synthwave vectors in real perspective ─────────────────────
+  // A camera a little above a ground plane, looking at the horizon. Depth z
+  // shrinks as the camera travels, so everything comes *toward* the viewer.
+  let travel = 0, lastStageT = 0, scene = null, prevScene = null, sceneMix = 1, sceneAt = 0, sceneTrack = null;
+  const CAM = 1.0;                                    // camera height in ground units
+  const proj = (sc, x, y, z) => {                      // world → screen; null behind the camera
+    if (z <= 0.05) return null;
+    const f = (sc.H - sc.hy) / CAM;
+    return [sc.W / 2 + (x / z) * f, sc.hy + ((CAM - y) / z) * f];
+  };
+  const rng = (seed) => () => { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646; };
+  function sky(g, sc, top, mid, low) {
+    const gr = g.createLinearGradient(0, 0, 0, sc.hy);
+    gr.addColorStop(0, top); gr.addColorStop(0.65, mid); gr.addColorStop(1, low);
+    g.fillStyle = gr; g.fillRect(0, 0, sc.W, sc.hy);
+  }
+  const STARS = (() => { const r = rng(7); return Array.from({ length: 140 }, () => [r(), r() * 0.8, r()]); })();
+  function stars(g, sc, a) {
+    for (const [x, y, s] of STARS) {
+      g.globalAlpha = a * (0.3 + 0.7 * Math.abs(Math.sin(sc.t * (0.5 + s) + s * 9)));
+      g.fillStyle = "#fff"; g.fillRect(x * sc.W, y * sc.hy, 1.2 + s, 1.2 + s);
+    }
+    g.globalAlpha = sceneAlpha;
+  }
+  let sceneAlpha = 1;
+  const sunCv = document.createElement("canvas");
+  function sun(g, sc, cx, cy, r, c0, c1, bands) {
+    // The striped synthwave sun: a gradient disc with bands cut out of its lower half.
+    const size = Math.ceil(r * 2 + 4);
+    if (sunCv.width !== size) { sunCv.width = size; sunCv.height = size; }
+    const s2 = sunCv.getContext("2d"); s2.clearRect(0, 0, size, size);
+    const gr = s2.createLinearGradient(0, 0, 0, size); gr.addColorStop(0, c0); gr.addColorStop(1, c1);
+    s2.fillStyle = gr; s2.beginPath(); s2.arc(size / 2, size / 2, r, 0, Math.PI * 2); s2.fill();
+    if (bands) {
+      s2.globalCompositeOperation = "destination-out";
+      const drift = (sc.t * 6) % 14;
+      for (let y = size * 0.5 + drift; y < size; y += 14) {
+        const k = (y - size * 0.5) / (size * 0.5);
+        s2.fillRect(0, y, size, 1 + 6 * k);
+      }
+      s2.globalCompositeOperation = "source-over";
+    }
+    g.save(); g.shadowColor = c1; g.shadowBlur = 40 + 40 * sc.kick;
+    g.drawImage(sunCv, cx - size / 2, cy - size / 2); g.restore();
+    g.globalAlpha = sceneAlpha;
+  }
+  function grid(g, sc, color, cols, rows) {
+    // the floor, rushing in: a line per unit of depth, travelling toward the viewer
+    g.strokeStyle = color; g.lineWidth = 1.2 + sc.heat;
+    const frac = sc.travel % 1;
+    for (let i = 0; i < rows; i++) {
+      const z = i + 1 - frac;
+      const p = proj(sc, 0, 0, z); if (!p || p[1] > sc.H) continue;
+      g.globalAlpha = sceneAlpha * Math.min(1, 2.2 / Math.sqrt(z));
+      g.beginPath(); g.moveTo(0, p[1]); g.lineTo(sc.W, p[1]); g.stroke();
+    }
+    g.globalAlpha = sceneAlpha;
+    for (let i = -cols; i <= cols; i++) {
+      const a = proj(sc, i * 0.9, 0, 0.4), b = proj(sc, i * 0.9, 0, 60);
+      g.beginPath(); g.moveTo(a[0], a[1]); g.lineTo(b[0], b[1]); g.stroke();
+    }
+  }
+  // Pieces that travel: mountains and pyramids at a depth, re-spawned far away.
+  function travellers(seed, n, make) {
+    const r = rng(seed);
+    return Array.from({ length: n }, (_, i) => make(r, (i / n) * 40));
+  }
+  const PEAKS = travellers(11, 46, (r, z0) => ({ side: r() < 0.5 ? -1 : 1, x: 3.6 + r() * 9, z0, h: 0.6 + r() * 2.6 * (0.4 + r()), w: 0.8 + r() * 1.6, sk: r() - 0.5 }));
+  const PYRS = travellers(23, 12, (r, z0) => ({ side: r() < 0.5 ? -1 : 1, x: 4 + r() * 8, z0, h: 1.2 + r() * 2.2, w: 1.2 + r() * 1.8 }));
+  const depthOf = (z0, sc) => { const z = ((z0 - sc.travel) % 40 + 40) % 40; return z + 0.6; };
+  function mountains(g, sc, edge, fill) {
+    const list = PEAKS.map((m) => ({ m, z: depthOf(m.z0, sc) })).sort((a, b) => b.z - a.z);
+    for (const { m, z } of list) {
+      const x = m.side * m.x;
+      const L = proj(sc, x - m.w, 0, z), R = proj(sc, x + m.w, 0, z), T = proj(sc, x + m.sk * m.w, m.h * (1 + 0.15 * sc.kick * sc.lvl), z + 0.3);
+      const B = proj(sc, x, 0, z - 0.5);
+      if (!L || !R || !T || !B) continue;
+      const near = Math.min(1, 6 / z);
+      // fade in from the haze, out as they pass close, so they line the edges
+      g.globalAlpha = sceneAlpha * Math.min(1, 1.6 / Math.sqrt(z / 3)) * Math.max(0, Math.min(1, (z - 1.5) / 2.5));
+      g.fillStyle = fill; g.beginPath(); g.moveTo(L[0], L[1]); g.lineTo(T[0], T[1]); g.lineTo(R[0], R[1]); g.lineTo(B[0], B[1]); g.closePath(); g.fill();
+      g.strokeStyle = edge; g.lineWidth = 0.8 + 1.4 * near;
+      g.stroke(); g.beginPath(); g.moveTo(T[0], T[1]); g.lineTo(B[0], B[1]); g.stroke();
+    }
+    g.globalAlpha = sceneAlpha;
+  }
+  function pyramids(g, sc, edge, fill) {
+    const list = PYRS.map((m) => ({ m, z: depthOf(m.z0, sc) })).sort((a, b) => b.z - a.z);
+    for (const { m, z } of list) {
+      const x = m.side * m.x, w = m.w;
+      const A = proj(sc, x - w, 0, z - w), Bp = proj(sc, x + w, 0, z - w), C = proj(sc, x + w, 0, z + w), T = proj(sc, x, m.h, z);
+      if (!A || !Bp || !C || !T) continue;
+      g.globalAlpha = sceneAlpha * Math.min(1, 1.8 / Math.sqrt(z / 3)) * Math.max(0, Math.min(1, (z - 2) / 3));
+      g.fillStyle = fill;
+      g.beginPath(); g.moveTo(A[0], A[1]); g.lineTo(Bp[0], Bp[1]); g.lineTo(T[0], T[1]); g.closePath(); g.fill();
+      g.beginPath(); g.moveTo(Bp[0], Bp[1]); g.lineTo(C[0], C[1]); g.lineTo(T[0], T[1]); g.closePath(); g.fill();
+      g.strokeStyle = edge; g.lineWidth = 1 + Math.min(2, 4 / z);
+      g.beginPath(); g.moveTo(A[0], A[1]); g.lineTo(Bp[0], Bp[1]); g.lineTo(C[0], C[1]); g.moveTo(A[0], A[1]); g.lineTo(T[0], T[1]);
+      g.lineTo(Bp[0], Bp[1]); g.moveTo(T[0], T[1]); g.lineTo(C[0], C[1]); g.stroke();
+    }
+    g.globalAlpha = sceneAlpha;
+  }
+  const CITY = (() => { const r = rng(5); const out = []; let x = 0; while (x < 1) { const w = 0.012 + r() * 0.03; out.push([x, w, 0.25 + r() * r() * 0.95, r()]); x += w + 0.002; } return out; })();
+  const SCENES = {
+    outrun(g, sc) {
+      sceneAlpha = g.globalAlpha;
+      sky(g, sc, "#120624", "#5a0f5c", "#ff2f9a"); stars(g, sc, 0.7);
+      sun(g, sc, sc.W / 2, sc.hy - sc.H * 0.08, sc.H * (0.16 + 0.015 * sc.kick), "#ffe45c", "#ff2fd1", true);
+      g.fillStyle = "#14062a"; g.fillRect(0, sc.hy, sc.W, sc.H - sc.hy);
+      grid(g, sc, rgba(sc.hue === COL.cyan ? COL.pink : sc.hue, 0.55 + 0.3 * sc.kick * sc.lvl), 22, 30);
+      mountains(g, sc, rgba(COL.cyan, 0.9), "rgba(28,12,70,.92)");
+    },
+    pyramids(g, sc) {
+      sceneAlpha = g.globalAlpha;
+      sky(g, sc, "#05060f", "#1b1240", "#ff7a3d"); stars(g, sc, 0.9);
+      sun(g, sc, sc.W * 0.62, sc.hy - sc.H * 0.2, sc.H * (0.09 + 0.008 * sc.kick), "#fff3c4", "#ff9a5c", false);
+      g.fillStyle = "#1a0d14"; g.fillRect(0, sc.hy, sc.W, sc.H - sc.hy);
+      grid(g, sc, rgba(COL.yellow, 0.35 + 0.3 * sc.kick * sc.lvl), 18, 26);
+      pyramids(g, sc, rgba("#ffb86b", 0.95), "rgba(60,20,40,.9)");
+    },
+    city(g, sc) {
+      sceneAlpha = g.globalAlpha;
+      sky(g, sc, "#060818", "#2a0e5a", "#d8237f"); stars(g, sc, 0.5);
+      sun(g, sc, sc.W / 2, sc.hy - sc.H * 0.03, sc.H * (0.2 + 0.012 * sc.kick), "#ffd36b", "#ff2fd1", true);
+      for (const [x, w, h, s] of CITY) {                      // the skyline, windows flickering on the beat
+        const bx = x * sc.W, bw = w * sc.W, bh = h * sc.H * 0.22, by = sc.hy - bh;
+        g.fillStyle = "#0b0720"; g.fillRect(bx, by, bw, bh);
+        g.fillStyle = rgba(s > 0.5 ? COL.cyan : COL.pink, 0.55 + 0.4 * sc.kick * (s > 0.7 ? 1 : 0));
+        for (let wy = by + 4; wy < sc.hy - 4; wy += 7) for (let wx = bx + 3; wx < bx + bw - 3; wx += 6)
+          if (((wx * 13 + wy * 7) ^ Math.floor(sc.t * 0.5 + s * 10)) % 5 === 0) g.fillRect(wx, wy, 2, 3);
+      }
+      g.fillStyle = "#07051a"; g.fillRect(0, sc.hy, sc.W, sc.H - sc.hy);
+      grid(g, sc, rgba(COL.cyan, 0.55 + 0.3 * sc.kick * sc.lvl), 22, 30);
+    },
+    ocean(g, sc) {
+      sceneAlpha = g.globalAlpha;
+      sky(g, sc, "#040b1f", "#173a8a", "#ff5fb8"); stars(g, sc, 0.6);
+      const sy = sc.hy - sc.H * 0.05, sr = sc.H * (0.15 + 0.012 * sc.kick);
+      sun(g, sc, sc.W / 2, sy, sr, "#ffe7a0", "#ff3fae", true);
+      g.fillStyle = "#06143a"; g.fillRect(0, sc.hy, sc.W, sc.H - sc.hy);
+      const frac = sc.travel % 1;
+      for (let i = 0; i < 34; i++) {                        // wave lines rolling in, and the sun's reflection on them
+        const z = (i + 1 - frac) * 0.7, p = proj(sc, 0, 0, z); if (!p || p[1] > sc.H) continue;
+        const y = p[1], amp = 2 + 6 / z;
+        g.strokeStyle = rgba(COL.cyan, 0.15 + 0.5 / Math.sqrt(z)); g.lineWidth = 1 + 1.5 / z;
+        g.beginPath();
+        for (let x = 0; x <= sc.W; x += 24) { const yy = y + Math.sin(x * 0.012 + sc.t * 1.6 + i) * amp; x ? g.lineTo(x, yy) : g.moveTo(x, yy); }
+        g.stroke();
+        const rw = sr * (1.3 - 0.3 / z) * (0.6 + 0.4 * Math.sin(sc.t * 3 + i * 1.7));
+        g.fillStyle = rgba(i % 2 ? "#ffd36b" : "#ff3fae", 0.55 * Math.min(1, 3 / z)); g.fillRect(sc.W / 2 - rw / 2 + Math.sin(sc.t + i) * 6, y - 1, rw, 2 + 2 / z);
+      }
+    },
+    tunnel(g, sc) {
+      sceneAlpha = g.globalAlpha;
+      g.fillStyle = "#04030c"; g.fillRect(0, 0, sc.W, sc.H);
+      const cx = sc.W / 2, cy = sc.H * 0.48, frac = (sc.travel * 0.5) % 1;
+      for (let i = 14; i >= 0; i--) {                       // rings rushing at the viewer, turning with the beat
+        const z = i + 1 - frac, s = (sc.H * 0.9) / z, rot = sc.t * 0.3 + i * 0.12 + sc.kick * 0.2;
+        const c = [COL.cyan, COL.pink, COL.purple, COL.green][(i + Math.floor(sc.travel * 0.5)) % 4];
+        g.strokeStyle = rgba(c, Math.min(1, 2.5 / z) * (0.6 + 0.4 * sc.lvl)); g.lineWidth = 1 + 6 / z;
+        g.beginPath();
+        for (let k = 0; k <= 6; k++) { const a = rot + (k / 6) * Math.PI * 2; const x = cx + Math.cos(a) * s * 1.4, y = cy + Math.sin(a) * s; k ? g.lineTo(x, y) : g.moveTo(x, y); }
+        g.stroke();
+      }
+    },
+  };
+  const SCENE_NAMES = Object.keys(SCENES);
+  function sceneTick(t, d) {
+    // One at random when the booth opens; a different one, crossfaded, each
+    // time a new record takes over.
+    if (!scene) { scene = SCENE_NAMES[Math.floor(Math.random() * SCENE_NAMES.length)]; sceneMix = 1; }
+    const id = d ? d.id : null;
+    if (id && sceneTrack && id !== sceneTrack) {
+      prevScene = scene; const others = SCENE_NAMES.filter((n) => n !== scene);
+      scene = others[Math.floor(Math.random() * others.length)]; sceneMix = 0; sceneAt = t;
+    }
+    if (id) sceneTrack = id;
+    if (sceneMix < 1) sceneMix = Math.min(1, (t - sceneAt) / 3);
+  }
+  // the stage: a floor rushing in on the beat, a horizon that kicks, level bars up the edges
+  function stage(t) {
+    const g = bg.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
+    const d = S && S.live ? masterDeck() : null;
+    let bt = null;
+    if (d && d.grid && d.state === "playing") bt = beatAt(d, posOf(d));
+    if (bt !== null) { const b = Math.floor(bt); if (b !== lastBeat) { lastBeat = b; kick = b % 4 === 0 ? 1 : 0.6; } }
+    kick *= 0.9; flash *= 0.94; red *= 0.95; aura = Math.max(aura - 0.0004, 0.3 * heat);
+    heat += (tierOf(combo) - heat) * (tierOf(combo) > heat ? 0.004 : 0.02);   // builds slowly, falls faster
+    const lvl = S && S.live ? Math.max(0, Math.min(1, (S.master + 42) / 42)) : 0;
+    // Past half heat the stage drifts through the booth's colours.
+    const drift = heat > 0.55 ? [COL.cyan, COL.green, COL.pink, COL.purple][Math.floor(t / 8) % 4] : null;
+    const hue = red > 0.05 ? COL.red : drift || (aura > 0.5 ? COL.green : COL.cyan);
+    const hy = H * 0.56;
+    // The scene: forward motion one grid row per beat of the record on air.
+    const dt = Math.min(0.1, t - (lastStageT || t)); lastStageT = t;
+    const bps = d && d.tempo ? d.tempo / 60 : 2;
+    travel += dt * (S && S.live && d && d.state === "playing" ? bps : 0.6) * (1 + 0.5 * heat);
+    sceneTick(t, d);
+    const sc = { t, kick, lvl, heat, hue, aura, hy, travel, W, H };
+    if (sceneMix < 1 && prevScene) { g.globalAlpha = 1 - sceneMix; SCENES[prevScene](g, sc); }
+    g.globalAlpha = sceneMix < 1 ? sceneMix : 1; SCENES[scene](g, sc); g.globalAlpha = 1;
+    // level bars up both edges, from the bands actually applied
+    const ch = (S && S.channels) || {}, a = ch[S && S.on_air] || {};
+    const bands = [a.low ?? 1, a.mid ?? 1, a.high ?? 1];
+    for (let side = 0; side < 2; side++) for (let k = 0; k < 24; k++) {
+      const band = bands[k % 3], v = lvl * band * (0.55 + 0.45 * Math.sin(t * 3 + k * 0.7 + side)) * (0.7 + 0.5 * kick);
+      const len = 6 + v * (W * 0.05) * (1 + aura + 1.5 * heat), y = 60 + (k / 24) * (H - 120);
+      g.fillStyle = rgba(k % 3 === 0 ? COL.pink : hue, 0.25 + 0.5 * v);
+      g.fillRect(side ? W - len : 0, y, len, (H - 120) / 24 - 3);
+    }
+    // From a few locked blends in: embers off the floor on the beat.
+    if (heat > 0.25 && kick > 0.55 && Math.random() < 0.8) {
+      for (let i = 0; i < Math.round(3 + 10 * heat); i++)
+        embers.push({ x: Math.random() * W, y: H - Math.random() * (H - hy) * 0.3, vy: -(40 + Math.random() * 90) * (0.6 + heat), t: t, life: 1.2 + Math.random() * 1.4, r: 1 + 2.2 * heat * Math.random() });
+      kick *= 0.98;
+    }
+    for (let i = embers.length - 1; i >= 0; i--) {
+      const e = embers[i], age = t - e.t; if (age > e.life || age < 0) { embers.splice(i, 1); continue; }
+      e.y += e.vy / 30; e.x += Math.sin(t * 2 + i) * 0.4;
+      g.globalAlpha = (1 - age / e.life) * 0.8; g.fillStyle = i % 3 ? hue : COL.pink;
+      g.beginPath(); g.arc(e.x, e.y, e.r, 0, Math.PI * 2); g.fill();
+    }
+    if (embers.length > 500) embers.splice(0, embers.length - 500);
+    g.globalAlpha = 1;
+    // Past half heat: a ring on the horizon that swells on the downbeat.
+    if (heat > 0.5) {
+      const rr = (60 + 140 * heat) * (1 + 0.12 * kick);
+      g.strokeStyle = rgba(hue, 0.25 + 0.35 * kick * heat); g.lineWidth = 2 + 3 * heat;
+      g.beginPath(); g.arc(W / 2, hy, rr, Math.PI, Math.PI * 2); g.stroke();
+    }
+  }
+  // in front: Kaia's hands as reticles, sparks, the aura, popups, red
+  function front(t) {
+    const g = top.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
+    const now = performance.now() / 1000;
+    // reticles on the knobs her hand is on
+    const held = new Set();
+    for (const el of document.querySelectorAll(".knob.herhand canvas")) {
+      // Where the knob is, re-measured four times a second at most: a layout
+      // read per held knob per frame is what made the booth itself expensive.
+      let pos = knobPos.get(el);
+      if (!pos || now - pos.t > 0.25) { const b = el.getBoundingClientRect(); pos = { r: { left: b.left, top: b.top, width: b.width, height: b.height }, t: now }; knobPos.set(el, pos); }
+      const r = pos.r; if (!r.width) continue;
+      const id = el.closest("[id]").id + ":" + el.dataset.k; held.add(id);
+      let st = reticles.get(id); if (!st || st.off) { st = { t0: now, off: 0 }; reticles.set(id, st); }
+      st.x = r.left + r.width / 2; st.y = r.top + r.height / 2; st.r = r.width / 2;
+      const badge = el.parentElement.querySelector(".kbadge"); st.down = badge && /-/.test(badge.textContent);
+      if (Math.random() < 0.55 + 0.4 * heat) {                  // sparks off the way she is turning, more as the set builds
+        const a0 = Math.random() * Math.PI * 2, sp = (st.down ? -1 : 1) * (60 + Math.random() * 90);
+        parts.push({ x: st.x + Math.cos(a0) * st.r * 1.3, y: st.y + Math.sin(a0) * st.r * 1.3,
+          vx: -Math.sin(a0) * sp, vy: Math.cos(a0) * sp, t: now, life: 0.5 + Math.random() * 0.4 });
+      }
+    }
+    for (const [id, st] of reticles) {
+      if (!held.has(id) && !st.off) st.off = now;
+      const k = st.off ? Math.min(1, (now - st.off) / 0.35) : 0;
+      if (k >= 1) { reticles.delete(id); continue; }
+      const zin = 1 + 1.8 * Math.exp(-(now - st.t0) * 7), sc = (zin + k * 1.5), alpha = 1 - k;
+      const R = st.r * 2.0 * sc, spin = (now - st.t0) * (st.down ? -2.2 : 2.2), pulse = 1 + 0.08 * Math.sin(now * 14);
+      g.save(); g.translate(st.x, st.y); g.globalAlpha = alpha;
+      g.strokeStyle = COL.pink; g.lineWidth = 2.6; g.shadowColor = COL.pink; g.shadowBlur = 16;
+      for (let q4 = 0; q4 < 4; q4++) {                         // four brackets, turning
+        const a = spin + q4 * Math.PI / 2;
+        g.beginPath(); g.arc(0, 0, R * pulse, a - 0.42, a + 0.42); g.stroke();
+      }
+      g.lineWidth = 1; g.globalAlpha = alpha * 0.6;
+      g.beginPath(); g.arc(0, 0, R * 1.32, 0, Math.PI * 2); g.setLineDash([3, 5]); g.lineDashOffset = -now * 30; g.stroke(); g.setLineDash([]);
+      for (const a of [0, Math.PI / 2, Math.PI, Math.PI * 1.5]) {   // crosshair ticks
+        g.beginPath(); g.moveTo(Math.cos(a) * R * 1.12, Math.sin(a) * R * 1.12); g.lineTo(Math.cos(a) * R * 1.5, Math.sin(a) * R * 1.5); g.stroke();
+      }
+      if (now - st.t0 < 0.6 && !st.off) { g.globalAlpha = (0.6 - (now - st.t0)) / 0.6; g.font = "700 9px Orbitron, monospace"; g.fillStyle = COL.pink;
+        g.fillText("KAIA", R * 0.9, -R * 0.9); }
+      g.restore();
+    }
+    // sparks
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const p = parts[i], age = now - p.t; if (age > p.life) { parts.splice(i, 1); continue; }
+      const dt = 1 / 60; p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= 0.96; p.vy *= 0.96;
+      g.globalAlpha = 1 - age / p.life; g.fillStyle = COL.pink; g.shadowColor = COL.pink; g.shadowBlur = 8;
+      const ps = 2.4 + 2.6 * heat; g.fillRect(p.x - ps / 2, p.y - ps / 2, ps, ps);
+    }
+    if (parts.length > 400) parts.splice(0, parts.length - 400);
+    g.shadowBlur = 0; g.globalAlpha = 1;
+    // the aura round the booth: builds through locked blends
+    const edge = 0.15 + 0.6 * aura + 0.4 * flash;
+    if (edge > 0.16) {
+      const col = aura > 0.5 || flash > 0.3 ? COL.green : COL.cyan;
+      for (const [x0, y0, x1, y1, w] of [[0, 0, 0, H, 1], [W, 0, W, H, -1]]) {
+        const gr = g.createLinearGradient(x0, 0, x0 + w * 90 * (1 + aura), 0);
+        gr.addColorStop(0, rgba(col, 0.35 * edge)); gr.addColorStop(1, "rgba(0,0,0,0)");
+        g.fillStyle = gr; g.fillRect(w > 0 ? 0 : W - 90 * (1 + aura), 0, 90 * (1 + aura), H);
+      }
+    }
+    // red: a vignette and glitch slices
+    if (red > 0.03) {
+      const vg = g.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.3, W / 2, H / 2, Math.max(W, H) * 0.75);
+      vg.addColorStop(0, "rgba(0,0,0,0)"); vg.addColorStop(1, rgba(COL.red, 0.55 * red)); g.fillStyle = vg; g.fillRect(0, 0, W, H);
+      for (let i = 0; i < 6 * red; i++) { g.fillStyle = rgba(COL.red, 0.25 * red); g.fillRect(0, Math.random() * H, W, 2 + Math.random() * 6); }
+    }
+    // popups and the combo
+    for (let i = pops.length - 1; i >= 0; i--) if (now - pops[i].t > 1.8) pops.splice(i, 1);
+    pops.forEach((p, i) => {                                   // newest on top, the older ones stacked under it
+      const age = now - p.t, k = age / 1.8, sz = (p.big ? 34 : 22) * (1 + 0.25 * Math.exp(-age * 10));
+      const row = pops.length - 1 - i;
+      g.globalAlpha = 1 - k * k; g.font = `900 ${sz}px Orbitron, monospace`; g.textAlign = "center";
+      g.fillStyle = p.color; g.shadowColor = p.color; g.shadowBlur = 20; g.fillText(p.text, W / 2, H * 0.34 - age * 30 + row * 46);
+    });
+    g.shadowBlur = 0; g.globalAlpha = 1; g.textAlign = "left";
+    if (combo > 0) {
+      g.font = `900 ${13 + Math.round(7 * heat)}px Orbitron, monospace`; g.fillStyle = COL.green; g.shadowColor = COL.green; g.shadowBlur = 10 + 10 * heat;
+      g.fillText(`COMBO ×${combo}`, W - 170, 74); g.shadowBlur = 0;
+      g.fillStyle = "rgba(42,53,84,.9)"; g.fillRect(W - 170, 82, 140, 3);                    // the heat bar
+      g.fillStyle = COL.green; g.fillRect(W - 170, 82, 140 * heat, 3);
+    }
+  }
+  function rgba(c, a) {
+    const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i.exec(String(c).trim());
+    return m ? `rgba(${parseInt(m[1], 16)},${parseInt(m[2], 16)},${parseInt(m[3], 16)},${Math.max(0, Math.min(1, a)).toFixed(3)})` : c;
+  }
+  let lastFx = 0;
+  function loop(ts) {
+    if (ts - lastFx >= FRAME_MS - 2) {
+      lastFx = ts;
+      try { if (on) { const t = ts / 1000; events(); stage(t); front(t); } else events(); } catch (e) { console.error(e); }
+    }
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  return { pop, bad, setCombo: (c) => { combo = c; }, scene: (n) => { if (SCENES[n]) { prevScene = scene; scene = n; sceneMix = 1; } return scene; }, state: () => ({ aura, combo, heat: +heat.toFixed(3), red, reticles: reticles.size, parts: parts.length, embers: embers.length }) };
+})();
+</script>
+</body>
+</html>

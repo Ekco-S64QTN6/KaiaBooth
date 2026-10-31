@@ -1,0 +1,2529 @@
+"""Records: a set from the local music library, mixed record to record.
+
+`!music records` plays the crate in `library.py` the way a DJ would: each next
+record chosen to sit with the last in key and tempo, stretched to its tempo
+(ffmpeg's rubberband, which keeps the pitch and the kicks where they were), its
+bar one dropped on a phrase of the record playing, and blended per band over
+32–128 beats — or, where the beats cannot be laid over each other, faded over
+eight bars. All of it is ffmpeg and NumPy on the CPU: no model, no VRAM.
+
+The free deck can also be worked by hand from the DJ booth: a record loaded
+onto it (`load`), its cue point moved (`set_cue`), played synced and on the
+beat (`play_hand`) while the faders do the mix, taking over once the record on
+air has gone quiet — or finished by Kaia (`finish`).
+
+The mixer renders complete 20 ms PCM frames on a worker. A bounded
+`BufferedRecordsSource` queue sits between it and discord.py, so the voice
+callback only dequeues an already-mixed frame and returns promptly. Each
+ffmpeg deck has its own decoder thread and buffer; choosing, measuring, and
+starting incoming decks happen away from the voice callback.
+"""
+from __future__ import annotations
+
+import asyncio
+import functools
+import queue
+import random
+import re
+import subprocess
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass, replace
+from typing import Callable, Iterable, Optional
+
+import numpy as np
+from pathlib import Path
+
+try:
+    import discord
+    _AudioSource = discord.AudioSource
+except Exception:                      # pragma: no cover
+    _AudioSource = object
+
+from utils.audio import library
+from utils.infrastructure.logging.kaia_logger import log_action, log_debug, log_error, log_info, log_warning
+from utils.infrastructure.system.gc_quiet import settle
+
+RATE = 48000
+FRAME_MS = 20
+FRAME_BYTES = RATE * 2 * 2 * FRAME_MS // 1000          # s16le stereo
+FRAMES_PER_S = 1000 // FRAME_MS
+SILENCE = b"\x00" * FRAME_BYTES
+#: A record shorter than this is not crossfaded into: there is no room.
+MIN_RECORD_S = 30.0
+
+
+def probe_seconds(path: str) -> Optional[float]:
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nokey=1:noprint_wrappers=1", path],
+            capture_output=True, text=True, timeout=20)
+        return float(out.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+#: Every record is brought to this integrated loudness (EBU R128, what the ear
+#: hears as loud), so the next one is not louder than the last. A record is
+#: raised only as far as its true peak allows, plus BOOST_HEADROOM_DB the soft
+#: limiter takes; it is lowered as far as needed whatever its peak.
+TARGET_LUFS = -11.0
+BOOST_HEADROOM_DB = 2.0
+
+
+@functools.lru_cache(maxsize=1024)
+def gain_db(path: str) -> float:
+    """The gain that brings a record to TARGET_LUFS. 0 if it cannot be measured."""
+    try:
+        out = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-i", path,
+                              "-af", "ebur128=peak=true:framelog=quiet", "-f", "null", "-"],
+                             capture_output=True, text=True, timeout=90).stderr
+        lufs = float(re.findall(r"I:\s*(-?[\d.]+) LUFS", out)[-1])
+        peak = float(re.findall(r"Peak:\s*(-?[\d.]+) dBFS", out)[-1])
+    except (OSError, IndexError, ValueError, subprocess.SubprocessError):
+        return 0.0
+    gain = TARGET_LUFS - lufs
+    if gain > 0:
+        gain = min(gain, max(0.0, -1.0 - peak) + BOOST_HEADROOM_DB)
+    return round(max(-12.0, min(gain, 12.0)), 1)
+
+
+def open_pcm(path: str, ratio: float = 1.0, gain: float = 0.0, offset: float = 0.0,
+             semitones: int = 0) -> subprocess.Popen:
+    """ffmpeg decoding a record to 48 kHz stereo s16le from `offset` seconds
+    of its own time, stretched by `ratio` (`beatgrid.stretch_filter`: tempo
+    changed, pitch and kick timing kept), its key moved by `semitones`."""
+    from utils.audio.beatgrid import stretch_filter
+    args = ["ffmpeg", "-nostdin", "-loglevel", "error"]
+    if offset > 0:
+        args += ["-ss", f"{offset:.4f}"]
+    args += ["-i", path]
+    filters = []
+    if (stretch := stretch_filter(ratio, semitones)):
+        filters.append(stretch)
+    if abs(gain) >= 0.1:
+        filters.append(f"volume={gain:.1f}dB")
+    if filters:
+        args += ["-af", ",".join(filters)]
+    args += ["-f", "s16le", "-ar", str(RATE), "-ac", "2", "pipe:1"]
+    return subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL)
+
+
+FRAME_SAMPLES = RATE * FRAME_MS // 1000
+#: The blend: this many beats from the incoming record's first downbeat to the
+#: outgoing record gone. The bass swaps halfway, on a bar.
+MIX_BEATS = 64
+#: Cut transitions (no common tempo, or no clear beat): the outgoing record
+#: fades over this many seconds, ending on its bar, and the next starts clean.
+CUT_FADE_S = 1.5
+#: Both records need a beat at least this clear (`beatgrid.Grid.contrast`) for
+#: their grooves to be laid over each other. Four-on-the-floor dance records
+#: measure 4.2 and up where they are mixed; rock, breaks and sparse intros
+#: (Big Country, Evil Nine, an ambient opening) measure 1.8–3.3, and blending
+#: those beat against beat is a clash. Below it the transition is a cut on the bar.
+BLEND_CONTRAST = 3.5
+#: A transition that cannot be beat-matched — a loose or beatless record on
+#: either side, tempos too far apart — is a fade over this many bars: the new
+#: record from its first sound, the two crossfaded equal-power, the basslines
+#: handed over halfway. Halved where the outgoing has no room for it.
+FADE_BARS = 8
+#: When no blend locks anywhere, the transition is an echo-out, never a bare
+#: cut: the outgoing stops on its bar and its last beat (mids and highs — no
+#: low end to clash with the new kick) repeats on the beat, each repeat this
+#: much quieter, under the incoming record's bar one.
+ECHO_FEEDBACK = 0.55
+ECHO_REPEATS = 6
+#: The outgoing's own fade at the drop of an echo-out: an eighth of a beat.
+ECHO_FADE_BEATS = 0.125
+#: How long the planner looks for a place a blend locks (`setlist.find_blend`),
+#: and then for another record that does (her own picks only), by mode: a
+#: skip should land in seconds, the end of a record has minutes.
+SEARCH_S = {"skip": 3.0, "end": 10.0}
+ALTERNATIVE_S = {"skip": 6.0, "end": 30.0}
+#: The kick cross-correlation may move the incoming record by at most this
+#: much. The counted grids land within a few ms (click tracks; a 2 ms comb at
+#: a real mix point agreed to 1 ms); larger corrections came from sparse
+#: intros and basslines the correlation latched onto.
+MAX_FINE_S = 0.020
+#: A blend leaves the incoming record at least this long to play on its own.
+IN_LEFT_S = 30.0
+#: The shortest blend: a blend planned without room for its length is halved
+#: down to this, never to a quick crossfade.
+MIN_BLEND_BEATS = 32
+#: The furthest two tracked beats may be predicted to drift apart over a whole
+#: blend before it is refused for a clean switch.
+MAX_DRIFT_S = 0.025
+#: How much of the incoming record before its first beat is decoded in a blend.
+PREROLL_S = 1.0
+#: A gap between frame requests longer than this is counted as late.
+LATE_S = 0.06
+#: Shorter gaps than LATE_S that a listener's jitter buffer may still not
+#: hide when they repeat; counted apart, so "no late frames" is not the whole story.
+JITTER_S = 0.04
+
+
+#: The mixer's three bands: LOW under this, HIGH over MID_TOP_HZ, MID between.
+#: The automix swaps the bass at LOW_TOP_HZ; the booth's EQ uses all three.
+LOW_TOP_HZ = 180
+MID_TOP_HZ = 2500
+
+
+def _bands():
+    from scipy.signal import butter
+    return (butter(2, LOW_TOP_HZ, btype="low", fs=RATE, output="sos"),
+            butter(2, MID_TOP_HZ, btype="high", fs=RATE, output="sos"))
+
+
+_SOS = None
+
+
+class Deck:
+    """One record being decoded: frames pumped from a byte stream into a buffer.
+
+    `pad` samples of silence go in front, so the record can start part-way
+    through a 20 ms frame — which is how its first downbeat is put exactly on
+    the outgoing record's bar rather than up to 20 ms off it."""
+
+    def __init__(self, record: library.Record, ratio: float, seconds: float,
+                 stream_factory: Callable[..., object] = open_pcm, buffer_frames: int = 150,
+                 gain: float = 0.0, pad: int = 0, offset: float = 0.0, semitones: int = 0):
+        self.record = record
+        self.ratio = ratio
+        self.gain = gain
+        self.semitones = int(semitones)                     # key moved by key sync
+        self.grid = None                                    # beatgrid.Grid of its opening, for display
+        self.slot = 1                                       # which CDJ: records alternate 1, 2, 1…
+        self.loaded_at = time.time()
+        self.pad = max(0, int(pad))
+        self.offset = max(0.0, offset)                      # seconds of the record skipped, own time
+        self.total_frames = int(((seconds - self.offset) / ratio * RATE + self.pad) / FRAME_SAMPLES)
+        self.played = 0
+        extra = {**({"gain": gain} if gain else {}), **({"offset": self.offset} if self.offset else {}),
+                 **({"semitones": self.semitones} if self.semitones else {})}
+        self._proc = stream_factory(record.path, ratio, **extra)
+        self._frames: deque[bytes] = deque()
+        self._lock = threading.Lock()
+        self._room = threading.Semaphore(buffer_frames)
+        self._eof = False
+        self._closed = False
+        self._zi = None
+        self._pump_thread = threading.Thread(
+            target=self._pump, daemon=True, name="kaia-records-deck"
+        )
+        self._pump_thread.start()
+
+    def _pump(self) -> None:
+        out = getattr(self._proc, "stdout", self._proc)
+        carry = b"\x00" * (self.pad * 4)                    # s16le stereo: 4 bytes a sample
+        try:
+            while not self._closed:
+                self._room.acquire()
+                if self._closed:
+                    break
+                need = FRAME_BYTES - len(carry)
+                chunk = carry + (out.read(need) if need > 0 else b"")
+                carry = b""
+                if len(chunk) > FRAME_BYTES:
+                    chunk, carry = chunk[:FRAME_BYTES], chunk[FRAME_BYTES:]
+                if not chunk:
+                    break
+                if len(chunk) < FRAME_BYTES:
+                    chunk = chunk + b"\x00" * (FRAME_BYTES - len(chunk))
+                with self._lock:
+                    self._frames.append(chunk)
+        except Exception as e:
+            log_debug(f"[records] deck read ended: {e}")
+        self._eof = True
+
+    def ready(self, frames: int = 25) -> bool:
+        with self._lock:
+            return len(self._frames) >= frames or self._eof
+
+    def frame(self) -> Optional[bytes]:
+        """The next frame; silence if decoding is behind; None once the record is over."""
+        with self._lock:
+            if self._frames:
+                self.played += 1
+                self._room.release()
+                return self._frames.popleft()
+        if self._eof:
+            return None
+        global DECKS_STARVED
+        DECKS_STARVED += 1
+        return SILENCE
+
+    def at(self, frames: Optional[int] = None) -> float:
+        """Seconds into the record as played (stretched) at the start of frame `frames`."""
+        n = self.played if frames is None else frames
+        return (n * FRAME_SAMPLES - self.pad) / RATE + self.offset / self.ratio
+
+    @property
+    def key(self) -> Optional[str]:
+        """The key it is sounding in: its own, moved by any key sync."""
+        return library.shift_key(self.record.key, self.semitones)
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.total_frames - self.played)
+
+    @property
+    def end(self) -> float:
+        return self.at(self.total_frames)
+
+    def split(self, frame: bytes) -> tuple:
+        """(low, mid, high) of a frame as float stereo, filtered with carried
+        state so consecutive frames join without a seam. The three sum back to
+        the frame exactly."""
+        global _SOS
+        from scipy.signal import sosfilt
+        if _SOS is None:
+            _SOS = _bands()
+        lo_sos, hi_sos = _SOS
+        x = np.frombuffer(frame, dtype=np.int16).astype(np.float32).reshape(-1, 2)
+        if self._zi is None:
+            self._zi = (np.zeros((lo_sos.shape[0], 2, 2)), np.zeros((hi_sos.shape[0], 2, 2)))
+        low, zl = sosfilt(lo_sos, x, axis=0, zi=self._zi[0])
+        high, zh = sosfilt(hi_sos, x, axis=0, zi=self._zi[1])
+        self._zi = (zl, zh)
+        return low, x - low - high, high
+
+    def close(self) -> None:
+        # A transition and session shutdown can both retire a deck.
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._room.release()
+        # Kill (a retired decoder has nothing to flush), reap even one that
+        # exited at EOF, close its stdout — or the stream itself when a test
+        # factory hands one over: utils/audio/process_lifecycle.
+        from utils.audio.process_lifecycle import stop
+        stop(self._proc, "decoder")
+        if self._pump_thread.is_alive() and threading.current_thread() is not self._pump_thread:
+            self._pump_thread.join(timeout=0.5)
+            if self._pump_thread.is_alive():
+                log_warning("[records] decoder reader did not stop after cleanup")
+
+
+#: Frames any deck has had to fill with silence because its decoder was
+#: behind, across the process; a set reports what it added. The voice
+#: thread's meters cannot see this: the frame is on time, and empty.
+DECKS_STARVED = 0
+
+#: Decoded frames the first record must have ready before a set starts (0.5 s).
+FIRST_DECK_FRAMES = 25
+
+
+def _wait_deck(deck, frames: int, timeout: float) -> bool:
+    """Wait (off the event loop) until `deck` has `frames` decoded, or `timeout`."""
+    ready = getattr(deck, "ready", None)
+    if ready is None:
+        return True
+    deadline = time.monotonic() + timeout
+    while not ready(frames) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return ready(frames)
+
+
+#: Opus told what it is encoding. Left on "auto" it guesses speech or music
+#: frame by frame and switches coding mode on a quiet bar or a breakdown,
+#: which is heard as a hiccup; a set is music throughout.
+OPUS_SIGNAL = "music"
+
+#: How long a NEXT or ▶ pressed during a booth load waits for it to land.
+LOAD_WAIT_S = 30.0
+
+
+@dataclass
+class Next:
+    """The record chosen to come next, analysed and waiting."""
+    record: library.Record
+    seconds: float
+    gain: float = 0.0
+    grid: Optional["beatgrid.Grid"] = None
+    #: Seconds to its first sound: a fade starts it there, not in its silence.
+    lead: float = 0.0
+    #: The bar (from bar one) its bassline comes in on, if found: a blend
+    #: starts it so that bar lands on the bass swap.
+    bass_in: Optional[int] = None
+    #: Who chose it: "hand" (loaded at the booth) and "request" (asked for, or
+    #: the next of a set picked at the booth) are mixed in however they can be;
+    #: her own picks ("set", "partner", "search", "pick") may be swapped for a
+    #: record that locks when they do not.
+    source: str = ""
+
+
+@dataclass
+class Plan:
+    """When and how the next record comes in, in seconds of the outgoing record
+    as played. A blend: the incoming starts at `start` so its first downbeat
+    lands on the outgoing bar at `drop`; its top end rises over `length/2`, the
+    bass swaps on the bar halfway, the outgoing top falls away by
+    `drop + length`. A cut: the outgoing fades out by `drop` and the next
+    record starts there."""
+    kind: str
+    start: float
+    drop: float
+    length: float
+    beat: float
+    ratio: float
+    nxt: Next
+    #: Seconds of the incoming record (its own time) skipped: its muted run-up
+    #: to the first beat, so a skip does not wait out a long intro.
+    offset: float = 0.0
+    mode: str = "skip"
+    why: str = ""
+    #: Why it is not a blend: "beat" (not steady or bar unknown), "tempo",
+    #: "room" (the blend would not fit before the music ends), "unlocked" (planned,
+    #: then measured on the two records and their beats do not lock), or "".
+    fallback: str = ""
+    #: What `mixcheck` measured of a blend before it was allowed, for the journal.
+    check: str = ""
+
+    @property
+    def done(self) -> float:
+        return self.drop + (self.length if self.kind in ("blend", "fade", "out", "echo") else 0.0)
+
+
+def plan_transition(now: float, out_ratio: float, out_grid, out_end: float, nxt: Next,
+                    mode: str = "skip", mix_beats: int = MIX_BEATS, lead: float = 0.4,
+                    allow_blend: bool = True, in_bars: Optional[int] = None) -> Plan:
+    """Plan the next transition from where the outgoing record is (`now`).
+    `in_bars` cues the incoming that many bars past its bar one instead of where
+    its bassline and steady beat put it (the search in `transition` tries several).
+
+    A blend needs both beats clear (BLEND_CONTRAST) and a common tempo within
+    stretching range; otherwise it is a cut, which never overlaps two grooves."""
+    in_grid = nxt.grid
+    playing_bpm = out_grid.bpm * out_ratio if out_grid else None
+    # Steady, and with both bars known: kicks on kicks is not enough, the
+    # incoming's bar one has to fall on a bar one, or its claps land on the
+    # outgoing's kicks and its phrases start mid-bar.
+    steady = bool(out_grid and in_grid and min(out_grid.contrast, in_grid.contrast) >= BLEND_CONTRAST
+                  and out_grid.bar_known and in_grid.bar_known)
+    # With both records' beats tracked, a beat is lockable wherever its ticks
+    # run straight, whatever its kick pattern, and bars are counted on the
+    # ticks from bar one: a breakbeat that scores loose on the onset comb, or
+    # whose bar the comb could not count, still blends beat on beat.
+    tracked = bool(out_grid and in_grid and out_grid.tracked and in_grid.tracked)
+    onset_steady = steady
+    # The incoming is cued at the first phrase from its bar one where its beat
+    # holds for the blend — past a loose intro, as a DJ scrubs to where the
+    # record locks — and the outgoing is judged at each drop tried below, so a
+    # blend mixes out before a beatless outro rather than being refused for one.
+    in_phrase = None
+    if tracked:
+        n = min(64, mix_beats)
+        for m in range(0, 65, 4):
+            j = in_grid.bar_tick + 4 * m
+            if j + n >= len(in_grid.ticks):
+                break
+            if in_grid.tick_steady(float(in_grid.ticks[j]), n=n):
+                in_phrase = m
+                break
+    if tracked and not steady:
+        steady = in_phrase is not None
+    if not allow_blend:
+        steady = False
+    ratio = library.tempo_ratio(playing_bpm, in_grid.bpm) if steady else None
+    drifts = no_phrase = False
+    if ratio is not None:
+        beat = 60.0 / playing_bpm
+        length = mix_beats * beat
+        # The bass swap lands where the incoming's bassline comes in: if that
+        # is later than the swap's bar, the incoming starts that many bars into
+        # its intro (always on a phrase), or the new low end would be a kick
+        # alone. The incoming is started just short of the bar it drops on.
+        swap_bars = mix_beats // 8
+        late = (nxt.bass_in - swap_bars) if nxt.bass_in is not None and nxt.bass_in > swap_bars else 0
+        if in_phrase:
+            late = max(late, in_phrase)
+        if in_bars is not None:
+            late = max(0, int(in_bars))
+        if tracked and in_grid.bar_tick + 4 * late < len(in_grid.ticks):
+            bar_in = float(in_grid.ticks[in_grid.bar_tick + 4 * late])
+        else:
+            bar_in = in_grid.counted(in_grid.downbeat + late * 4 * in_grid.beat)
+        offset = max(0.0, bar_in - PREROLL_S)
+        lead_in = (bar_in - offset) / ratio                  # incoming: start to the bar it drops on
+        earliest = now + lead_in + lead
+        bar = 4 * beat
+
+        def out_ok(d: float) -> bool:
+            return onset_steady or out_grid.tick_steady(d * out_ratio, n=min(64, mix_beats))
+
+        def next_bar(t_played: float, every: int = 1) -> float:
+            """The outgoing's next phrase start at or after `t_played`: a real
+            tracked beat counted from its bar one, where it has ticks."""
+            if tracked:
+                v = out_grid.tick_bar(t_played * out_ratio, every)
+                return v / out_ratio if v is not None else float("inf")
+            return out_grid.next_bar(t_played, out_ratio, every)
+        drop = None
+        if mode == "end":
+            # The last phrase of eight bars (else four, else any bar) that
+            # leaves room for the whole blend before the record ends.
+            latest = out_end - length - 0.5
+            # Further back a phrase at a time while the beat there will not
+            # hold a blend.
+            for every in (8, 4, 1):
+                for back in range(1, 13):
+                    d = next_bar(latest - back * every * bar, every)
+                    if d < earliest:
+                        break
+                    if d <= latest + 0.01 and out_ok(d):
+                        drop = d
+                        break
+                if drop is not None:
+                    break
+        else:
+            # A skip comes in on the next four-bar phrase where the beat holds,
+            # or the next bar if that would not leave room.
+            for every in (4, 1):
+                d = next_bar(earliest, every)
+                for _ in range(8):
+                    if d + length > out_end + 0.01:
+                        break
+                    if out_ok(d):
+                        drop = d
+                        break
+                    d = next_bar(d + bar / 2, every)
+                if drop is not None:
+                    break
+        if drop is None and onset_steady:
+            drop = next_bar(earliest)
+        if drop is None:
+            drop, no_phrase = float("inf"), True   # no phrase where both beats hold: not a blend
+        if not tracked:
+            # On the outgoing's real kick: the bar counted on its tracked beats.
+            counted = out_grid.counted(drop * out_ratio) / out_ratio
+            if abs(counted - drop) < beat / 2 and counted >= now + lead_in:
+                drop = counted
+        # The stretch from the two records' tempos over the blend itself, where
+        # their beats were tracked: a whole-record figure let a record whose
+        # tempo moves a little slide off the other's kick over a long ride.
+        if out_grid.ticks is not None and in_grid.ticks is not None:
+            out_beat = out_grid.local_beat(drop * out_ratio, mix_beats) / out_ratio
+            local = library.tempo_ratio(60.0 / out_beat, 60.0 / in_grid.local_beat(bar_in, mix_beats))
+            if local is not None and abs(local / ratio - 1.0) < 0.02:
+                ratio = local
+                lead_in = (bar_in - offset) / ratio
+        # Decided before it starts: where both records' beats are tracked, the
+        # two beats may not drift further apart than MAX_DRIFT_S over the whole
+        # blend, or it is not a blend.
+        if out_grid.ticks is not None and in_grid.ticks is not None:
+            out_beat = out_grid.local_beat(drop * out_ratio, mix_beats) / out_ratio
+            in_beat = in_grid.local_beat(bar_in, mix_beats) / ratio
+            in_beat *= min((0.5, 1.0, 2.0), key=lambda k: abs(out_beat - in_beat * k))   # half/double time
+            drifts = abs(out_beat - in_beat) * mix_beats > MAX_DRIFT_S
+        # Room on both sides: the outgoing before its music ends, and the
+        # incoming with IN_LEFT_S still to play once it is the record on air.
+        if (not drifts and drop != float("inf") and drop + length <= out_end + 0.01
+                and length <= (nxt.seconds - offset) / ratio - IN_LEFT_S):
+            return Plan("blend", drop - lead_in, drop, length, beat, ratio, nxt, offset)
+    # Not beat-matched: a clean switch, never two grooves at once. The
+    # outgoing fades over its last beat into a bar line and the incoming's first
+    # beat lands exactly on it — at the playing tempo where it can be stretched
+    # to it, so the pulse carries straight on.
+    fallback = ("unlocked" if not allow_blend else "beat" if not steady or no_phrase else
+                ("tempo" if ratio is None else ("drift" if drifts else "room")))
+    beat = 60.0 / playing_bpm if playing_bpm else 0.5
+    sw_ratio = (library.tempo_ratio(playing_bpm, in_grid.bpm) if out_grid and in_grid else None) or 1.0
+    if mode == "end" and out_grid:
+        drop = None
+        for every in (8, 4, 1):
+            d = out_grid.next_bar(out_end - beat - every * 4 * beat, out_ratio, every)
+            if now + lead <= d <= out_end - 0.05:
+                drop = d
+                break
+        drop = drop if drop is not None else max(now + lead, out_end - 0.05)
+    elif out_grid:
+        drop = out_grid.next_bar(now + lead, out_ratio)
+        if drop > out_end - 0.05:
+            drop = max(now + lead, out_end - 0.05)
+    else:
+        drop = min(now + lead, max(now, out_end - 0.05))
+    if out_grid:
+        counted = out_grid.counted(drop * out_ratio) / out_ratio
+        if abs(counted - drop) < beat / 2 and now + lead / 2 <= counted <= out_end:
+            drop = counted
+    # The incoming from its first beat (its bar one where counted), else its first sound.
+    offset = nxt.lead
+    if in_grid is not None:
+        first = in_grid.downbeat if in_grid.bar_known else in_grid.downbeat % in_grid.beat
+        if in_grid.ticks is not None and len(in_grid.ticks):
+            k = int(np.searchsorted(in_grid.ticks, max(nxt.lead, first) - 0.05))
+            if k < len(in_grid.ticks):
+                first = float(in_grid.ticks[k])
+        offset = max(0.0, first)
+    return Plan("cut", drop, drop, min(max(beat, 0.25), 0.8), beat, sw_ratio, nxt, offset, fallback=fallback)
+
+
+def _ease(x):
+    """0→1 along a cosine S: slow off the mark, slow into place."""
+    return 0.5 - 0.5 * np.cos(np.pi * np.clip(x, 0.0, 1.0))
+
+
+#: The incoming record's mids while the outgoing's are still up: low enough
+#: that its vocal stays out of the way (−14 dB), enough to keep its chords in
+#: the blend. The rest comes in at the handoff.
+MID_HOLD = 0.2
+#: The vocals change hands over this many beats, centred on the bass swap: the
+#: outgoing's phrase is let finish, the incoming's starts on the downbeat. Two
+#: beats with the bass changing too slammed the whole record in at once.
+MID_HANDOFF_BEATS = 4.0
+
+
+#: The basslines hand over across this many beats, starting on the halfway bar
+#: (where `bass_entry` puts the incoming's bassline), equal-power, and at most a
+#: quarter of the blend. One beat was a switch — the old bass gone and the new one
+#: in within half a second — which Ekco heard as "way too jerky" (31 Oct).
+#: Equal-power, not complementary amplitude: two different basslines add by
+#: power, and a linear pair dipped the low end 3 dB at its middle.
+BASS_SWAP_BEATS = 8.0
+
+
+def gains(plan: Plan, t: np.ndarray) -> tuple:
+    """(outgoing low, mid, high, incoming low, mid, high) gains at times t.
+
+    A blend staged the way DJs ride an EQ mix: the incoming record comes in
+    with its highs (hats, percussion) over the first ramp and its mids held at
+    MID_HOLD, while the outgoing plays on whole, vocal and all — the ride, both
+    up and locked. From the bar halfway the basslines hand over equal-power across
+    BASS_SWAP_BEATS (never none) and the mids hand over in MID_HANDOFF_BEATS around it, so
+    the outgoing's vocal phrase finishes and the incoming's starts on the one;
+    two vocals never play together at full. Then the outgoing's highs go over
+    the last ramp. `ramp` is a quarter of a short blend, an eighth of a long one."""
+    if plan.kind == "cut":
+        out = np.clip((plan.drop - t) / plan.length, 0.0, 1.0)
+        inc = (t >= plan.drop).astype(np.float32)
+        return out, out, out, inc, inc, inc
+    if plan.kind == "echo":
+        # Full to the bar, out over `length` after it; the incoming from the bar.
+        # Its last beat goes on repeating (`echo_tail`).
+        out = np.clip((plan.drop + plan.length - t) / plan.length, 0.0, 1.0)
+        inc = np.clip((t - plan.drop) / 0.005, 0.0, 1.0)
+        return out, out, out, inc, inc, inc
+    if plan.kind == "out":
+        # The incoming is already playing (started by hand): only the outgoing
+        # moves — its bass gone on the bar, the rest fading out equal-power.
+        x = np.clip((t - plan.drop) / plan.length, 0.0, 1.0)
+        out = np.cos(x * np.pi / 2)
+        one = np.ones_like(out)
+        return 1.0 - np.clip((t - plan.drop) / plan.beat, 0.0, 1.0), out, out, one, one, one
+    if plan.kind == "fade":
+        x = np.clip((t - plan.drop) / plan.length, 0.0, 1.0)
+        out, inc = np.cos(x * np.pi / 2), np.sin(x * np.pi / 2)        # equal power
+        bass = np.clip((t - (plan.drop + plan.length / 2)) / plan.beat, 0.0, 1.0)
+        return 1.0 - bass, out, out, bass, inc, inc
+    L, d = plan.length, plan.drop
+    r = ramp(plan)
+    swap = d + L / 2
+    # The basslines hand over from the swap bar across BASS_SWAP_BEATS, equal-power.
+    w = max(plan.beat, min(BASS_SWAP_BEATS * plan.beat, L / 4))
+    x = _ease((t - swap) / w)
+    out_low, in_low = np.cos(x * np.pi / 2), np.sin(x * np.pi / 2)
+    in_high = _ease((t - d) / r)
+    # The vocals change hands around the swap; until then the incoming's mids
+    # wait at MID_HOLD, brought up with its highs.
+    h = min(MID_HANDOFF_BEATS * plan.beat, r)
+    handoff = _ease((t - (swap - h / 2)) / h)
+    in_mid = MID_HOLD * _ease((t - d) / r) * (1 - handoff) + handoff
+    out_mid = 1.0 - handoff
+    out_high = 1.0 - _ease((t - (d + L - r)) / r)
+    return out_low, out_mid, out_high, in_low, in_mid, in_high
+
+
+def as_echo(plan: Plan) -> Plan:
+    """A planned cut made an echo-out on the same bar (see ECHO_FEEDBACK)."""
+    if plan.kind == "cut":
+        plan.kind = "echo"
+        plan.length = max(0.02, ECHO_FADE_BEATS * plan.beat)
+    return plan
+
+
+def echo_tail(last_beat: np.ndarray, beat_s: float) -> np.ndarray:
+    """The repeats of the outgoing's last beat (float stereo, mids and highs),
+    from the drop on: one every beat, each ECHO_FEEDBACK quieter than the last
+    and a little darker (a one-pole low-pass per repeat, as tape echo dulls)."""
+    d = max(1, int(round(beat_s * RATE)))
+    n = len(last_beat)
+    if n == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    out = np.zeros((d * (ECHO_REPEATS - 1) + n, 2), dtype=np.float32)
+    x = last_beat.astype(np.float32)
+    # Each repeat fades in and out over a few ms so its edges do not click.
+    edge = min(n // 4, int(0.004 * RATE))
+    win = np.ones(n, dtype=np.float32)
+    if edge > 0:
+        win[:edge] = np.linspace(0, 1, edge)
+        win[-edge:] = np.linspace(1, 0, edge)
+    from scipy.signal import lfilter
+    g = 1.0
+    for k in range(ECHO_REPEATS):
+        g *= ECHO_FEEDBACK
+        x = lfilter([0.35], [1, -0.65], x, axis=0).astype(np.float32) if k else x
+        out[k * d:k * d + n] += g * x * win[:, None]
+    return out
+
+
+def ramp(plan: Plan) -> float:
+    """How long each stage of a blend's way in and way out takes: a quarter
+    of a short blend, an eighth of a long one (never under four bars), so a
+    long blend is mostly the ride — both records up, locked, the bass swapped
+    halfway through it."""
+    return min(plan.length / 4, max(plan.length / 8, 16 * plan.beat))
+
+
+# ── Kaia's hands ─────────────────────────────────────────────────────
+#
+# On top of the automix she rides the mixer the way a DJ does, every move
+# locked to the bars: while two records ride together she pulls both down a
+# touch so they sit under the limiter, trades the mids between them phrase by
+# phrase, and kills both basslines for the beat before the swap so the new
+# one lands; with one record playing she reaches for the EQ into the end of a
+# phrase — bass held back, air lifted, mids scooped — and lets go on the one.
+# How deep and how often follows her energy. No model, no randomness: which
+# gesture comes is a hash of the record and the phrase.
+
+#: Both records while they ride together: about -1.5 dB each.
+STAGE = 0.84
+#: Bars in the phrases she gestures into, and trades mids over in a ride.
+PHRASE_BARS = 16
+TRADE_BARS = 8
+
+
+def kaia_hands(plan: Optional[Plan], t: np.ndarray, energy: float = 0.5, grid=None,
+               ratio: float = 1.0, seed: int = 0) -> tuple:
+    """Multipliers on the automix — (outgoing low, mid, high, incoming low,
+    mid, high), per sample — and a few words for what she is doing."""
+    one = np.ones_like(t, dtype=np.float32)
+    f = [one.copy() for _ in range(6)]
+    e = min(1.0, max(0.0, float(energy)))
+    label = ""
+    if plan is not None and plan.kind == "blend":
+        L, d, b = plan.length, plan.drop, plan.beat
+        r = ramp(plan)
+        swap = d + L / 2
+        lo_w, hi_w = d + 2 * r, d + L - 2 * r
+        now = float(t[-1])
+        if hi_w - lo_w >= 16 * b:
+            inside = _ease((t - lo_w) / b) * (1 - _ease((t - (hi_w - b)) / b))
+            stage = 1 - (1 - STAGE) * inside
+            for i in range(6):
+                f[i] = f[i] * stage
+            # Trading the highs: one record's hats lead each TRADE_BARS, the
+            # other's step back. Not the mids: those carry the vocals, and the
+            # outgoing's are let run until the handoff.
+            depth = 0.06 + 0.06 * e
+            phrase = TRADE_BARS * 4 * b
+            k = np.floor((t - lo_w) / phrase)
+            lead = (k % 2 == 1).astype(np.float32)                   # 1: the incoming leads
+            prev = np.where(k >= 1, 1 - lead, lead)
+            lead = prev + (lead - prev) * _ease((t - (lo_w + k * phrase)) / b)
+            swing = depth * (2 * lead - 1) * inside
+            f[2] = f[2] * (1 - swing)
+            f[5] = f[5] * (1 + swing)
+            if lo_w <= now < hi_w:
+                label = f"riding both, trading the hats — the {'new' if lead[-1] > 0.5 else 'old'} one leads"
+        if e >= 0.45:
+            # The old record's air eased back a little over the bar into the
+            # swap. No bass kill: a beat with no bass at all, every blend, was a
+            # trick played as a habit, and with the handoff it slammed the new
+            # record in.
+            bump = _ease((t - (swap - 4 * b)) / (3 * b)) * (1 - _ease((t - swap) / (2 * b)))
+            f[2] = f[2] * (1 - 0.12 * e * bump)
+            if swap - 4 * b <= now < swap:
+                label = "easing the old one's air back into the swap"
+    elif plan is None and grid is not None and getattr(grid, "bar_known", False) and e > 0.15:
+        bar = 4 * grid.beat / ratio
+        bi = (t - grid.downbeat / ratio) / bar + grid.bar0
+        ph = int(np.floor(float(bi[-1]) / PHRASE_BARS))
+        # Rare and small: a move into every phrase, released on the one, was
+        # a beginner riding the EQ for something to do.
+        every = 2 if e > 0.7 else 4 if e > 0.4 else 8
+        depth = 0.3 + 0.2 * e
+
+        def gesture(n):
+            import zlib
+            if n < 1 or n % every:
+                return None
+            return ("tension", "air", "scoop")[zlib.crc32(f"{seed}:{n}".encode()) % 3]
+
+        pos = bi - ph * PHRASE_BARS                                 # bars into this phrase
+        g = gesture(ph + 1)                                         # the one being built towards
+        if g == "tension":
+            f[0] = 1 - 0.4 * depth * _ease(pos - 14)
+            label = "holding the bass back into the phrase"
+        elif g == "air":
+            f[2] = 1 + 0.18 * depth * _ease((pos - 12) / 4)
+            label = "lifting the air into the phrase"
+        elif g == "scoop":
+            f[1] = 1 - 0.22 * depth * _ease((pos - 12) / 2)
+            label = "scooping the mids into the phrase"
+        # Let the last one go over the first bar of the phrase, not on the one.
+        let_go = 1 - _ease(pos)
+        if gesture(ph) == "air":
+            f[2] = f[2] * (1 + 0.18 * depth * let_go)
+        elif gesture(ph) == "tension":
+            f[0] = f[0] * (1 - 0.4 * depth * let_go)
+        elif gesture(ph) == "scoop":
+            f[1] = f[1] * (1 - 0.22 * depth * let_go)
+        if float(pos[-1]) < 12 and not (gesture(ph) and float(pos[-1]) < 2):
+            label = ""
+    return tuple(f), label
+
+
+IDENTITY = (1.0, 1.0, 1.0, 1.0)
+#: The automix with one record playing and nothing coming in.
+SOLO = (1.0, 1.0, 1.0, 0.0, 0.0, 0.0)
+#: Both decks open: the booth's hands are the whole mix.
+BOTH = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+#: A deck played by hand takes over once the record on air has been silent
+#: (paused, faded down, crossfaded away) this long, or has ended.
+HANDOVER_S = 2.0
+#: Kaia finishing a mix that was started by hand: the outgoing's fade, in bars.
+FINISH_BARS = 8
+#: The tempo glide: a record stretched to the set's tempo is moved back toward
+#: its own by this much of its tempo at a time, every GLIDE_BARS bars, starting
+#: GLIDE_AFTER_BARS after it took over.
+GLIDE_STEP = 0.005
+GLIDE_BARS = 8
+GLIDE_AFTER_BARS = 16
+
+
+def mix_frames(out_parts, in_parts, g, uo=IDENTITY, ui=IDENTITY, master: float = 1.0) -> bytes:
+    """The two decks summed: each band times the automix gain (`g`: low, mid,
+    high for each record, per sample or constant) times the hands on the
+    mixer (`uo`/`ui`: low, mid, high, channel gain)."""
+    gol, gom, goh, gil, gim, gih = (np.asarray(x, dtype=np.float32).reshape(-1, 1) for x in g)
+    y = np.zeros((FRAME_SAMPLES, 2), dtype=np.float32)
+    if out_parts is not None:
+        lo, mi, hi = out_parts
+        y += (lo * (gol * uo[0]) + mi * (gom * uo[1]) + hi * (goh * uo[2])) * uo[3]
+    if in_parts is not None:
+        lo, mi, hi = in_parts
+        y += (lo * (gil * ui[0]) + mi * (gim * ui[1]) + hi * (gih * ui[2])) * ui[3]
+    if master != 1.0:
+        y *= master
+    return np.clip(np.rint(_soft_limit(y)), -32768, 32767).astype(np.int16).tobytes()
+
+
+#: Above this level the sum is bent smoothly toward full scale rather than
+#: clipped: two full records playing together run hot.
+LIMIT_FROM = 0.80 * 32767
+
+
+def _soft_limit(y: np.ndarray) -> np.ndarray:
+    a = np.abs(y)
+    if a.max() <= LIMIT_FROM:
+        return y
+    head = 32767 - LIMIT_FROM
+    over = a > LIMIT_FROM
+    out = y.copy()
+    out[over] = np.sign(y[over]) * (LIMIT_FROM + head * np.tanh((a[over] - LIMIT_FROM) / head))
+    return out
+
+
+class Controls:
+    """The mixer as someone at the booth has set it, on top of the automix:
+    per channel TRIM (dB), HI / MID / LOW (0 kills, 1 is flat, up to 1.5),
+    the channel fader (0–1); the crossfader (None until touched, then 0 = all
+    channel 1, 1 = all channel 2, both full in the middle); MASTER (0–1.5).
+    Kaia's automix still runs underneath: the two multiply."""
+
+    LIMITS = {"trim": (-12.0, 12.0), "high": (0.0, 1.5), "mid": (0.0, 1.5), "low": (0.0, 1.5),
+              "fader": (0.0, 1.0)}
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self) -> None:
+        self.channels = {1: self._flat(), 2: self._flat()}
+        self.xfader: Optional[float] = None
+        self.master = 1.0
+
+    @staticmethod
+    def _flat() -> dict:
+        return {"trim": 0.0, "high": 1.0, "mid": 1.0, "low": 1.0, "fader": 1.0}
+
+    def set(self, slot: Optional[int], name: str, value: float) -> bool:
+        if name == "xfader":
+            self.xfader = None if value is None else min(1.0, max(0.0, float(value)))
+            return True
+        if name == "master":
+            self.master = min(1.5, max(0.0, float(value)))
+            return True
+        if slot in self.channels and name in self.LIMITS:
+            lo, hi = self.LIMITS[name]
+            self.channels[slot][name] = min(hi, max(lo, float(value)))
+            return True
+        return False
+
+    def channel(self, slot: int) -> tuple:
+        """(low, mid, high, gain) multipliers for one channel."""
+        c = self.channels.get(slot) or self._flat()
+        gain = c["fader"] * 10 ** (c["trim"] / 20)
+        if self.xfader is not None:
+            gain *= min(1.0, 2 * (1 - self.xfader)) if slot == 1 else min(1.0, 2 * self.xfader)
+        return (c["low"], c["mid"], c["high"], gain)
+
+    def flat(self) -> bool:
+        return (self.xfader is None and self.master == 1.0
+                and all(c == self._flat() for c in self.channels.values()))
+
+    def state(self) -> dict:
+        return {"channels": {str(k): dict(v) for k, v in self.channels.items()},
+                "xfader": self.xfader, "master": self.master}
+
+
+class CrossfadeSource(_AudioSource):
+    """Plays decks one after another, mixing each into the next on the beat.
+
+    `pick(deck)` returns the Next record for after `deck`, or None. `grid_at`
+    finds the outgoing record's beat round a point, and `verify` measures a
+    planned blend on the two records (both patched out in tests)."""
+
+    def __init__(self, first: Deck, pick: Callable[[Deck], Optional[Next]],
+                 stream_factory=open_pcm, on_change: Optional[Callable[[library.Record], None]] = None,
+                 mix_beats: int = MIX_BEATS, grid_at: Optional[Callable] = None,
+                 verify: Optional[Callable] = None):
+        self.current: Optional[Deck] = first
+        self.incoming: Optional[Deck] = None
+        self.plan: Optional[Plan] = None
+        self._pick = pick
+        self._factory = stream_factory
+        self._on_change = on_change
+        self._mix_beats = mix_beats
+        self._grid_at = grid_at or _default_grid_at
+        self._verify = verify
+        self.say: Optional[Callable[[str, str], None]] = None     # the session's feed (`dj_voice`)
+        #: Other records to try, readied, when her pick will not lock with the
+        #: record on air (`RecordsSession._alternatives`).
+        self.alternatives: Optional[Callable[[Deck, Next], Iterable[Next]]] = None
+        self._queued: Optional[Next] = None
+        self._picking = False
+        self._exhausted = False             # the last pick found nothing to play
+        self._planning = False
+        self._start_frame: Optional[int] = None
+        self.frames_sent = 0
+        # What the mixer is doing, for the DJ dashboard: pre-fader levels of
+        # each deck and the mix (dBFS), the band gains applied this frame, and
+        # every transition planned.
+        self.levels = {"a": -90.0, "b": -90.0, "master": -90.0}
+        #: Every frame's levels, (frame number, slot on air, on-air dB, other dB,
+        #: master dB): the booth's meters play these back frame by frame. One
+        #: sample every 40 ms, polled at 20 Hz, missed most kicks.
+        self.meter: deque = deque(maxlen=64)
+        self.applied = SOLO
+        #: Kaia's own hands this frame — her multipliers on (outgoing low, mid,
+        #: high, incoming low, mid, high), apart from the automix — so the booth
+        #: can show which knob she is turning and by how much.
+        self.hands_now = (1.0,) * 6
+        self.history: list[dict] = []
+        self.planning_mode: Optional[str] = None
+        self.controls = Controls()
+        self.paused: set = set()                  # deck slots someone paused at the booth
+        # The free deck at the booth: a record loaded by hand (`by_hand`), its
+        # cue point (seconds of its own time; None: Kaia's choice), and a deck
+        # played by hand (`hand`), started synced on the beat, mixed by the
+        # faders until it takes over.
+        self.cue: Optional[float] = None
+        self.by_hand = False
+        self.hand: Optional[Deck] = None
+        self.hand_next: Optional[Next] = None
+        self.hand_synced = False
+        self._hand_k: Optional[int] = None        # the on-air deck's frame it starts on
+        self._hand_on = False
+        self._hand_quiet = 0
+        self._hand_starting = False
+        self._gen = 0                             # bumped by every hand on the free deck
+        # Kaia's hands on the mixer (`kaia_hands`), how much energy she has
+        # for them (0–1, from her mood), and what she is doing right now.
+        self.rides = True
+        self.key_sync = True                      # shift a clashing incoming a semitone to fit
+        # The tempo glide: the record on air respliced, a step nearer its own
+        # tempo, onto a fresh decoder (`_splice`: deck, frame it starts on,
+        # frame it takes over on), so every deck keeps one constant stretch.
+        self.tempo_glide = True
+        self._splice: Optional[tuple] = None
+        self._gliding = False
+        self._glide_next = int(GLIDE_AFTER_BARS * 2 * FRAMES_PER_S)
+        self.energy = 0.5
+        self.gesture = ""
+        # An echo-out: the outgoing's last beat as it is captured (`_echo_cap`,
+        # for the plan `_echo_for`), then its repeats playing out from the drop
+        # (`_echo_tail` from sample `_echo_pos`), across the change of record.
+        self._echo_for: Optional[Plan] = None
+        self._echo_cap: list = []
+        self._echo_tail: Optional[np.ndarray] = None
+        self._echo_pos = 0
+        self._lock = threading.RLock()
+        self._prefetch()
+
+    def is_opus(self) -> bool:
+        return False
+
+    def _prefetch(self) -> None:
+        if self._picking or self._queued or self.current is None:
+            return
+        self._picking = True
+        deck, gen = self.current, self._gen
+
+        def run():
+            picked = None
+            try:
+                picked = self._pick(deck)
+            except Exception as e:
+                log_warning(f"[records] could not choose the next record: {e}")
+            finally:
+                with self._lock:
+                    if gen == self._gen and self._queued is None:
+                        self._queued = picked
+                        self._exhausted = picked is None
+                    self._picking = False
+        threading.Thread(target=run, daemon=True, name="kaia-records-pick").start()
+
+    def skip(self) -> None:
+        """Bring the next record in at the next phrase it can land on. A blend
+        planned for later (the end of the record) that has not started is
+        called off and planned again from here; a skip already planned is kept.
+        With a deck playing by hand, Kaia finishes that mix instead."""
+        if self.hand is not None:
+            self.finish()
+            return
+        with self._lock:
+            # A skip already on its way stays on its way. Planned again from now,
+            # each press moved it a phrase later — and the planner's search and a
+            # fresh decoder ran again every time (24 Oct: six NEXTs in nine
+            # seconds, each pushing the echo 2 s on).
+            pending = self.plan if (self.plan is not None and not self.blend_started()) else None
+            if (pending is not None and pending.mode == "skip") or \
+                    (self._planning and self.planning_mode == "skip"):
+                log_debug("[records] skip pressed again; the one on its way stands")
+                return
+            if self._call_off_plan():
+                log_debug("[records] the planned blend was called off for a skip")
+        self._begin_planning("skip")
+
+    # ── the free deck, by hand ──────────────────────────────────────
+
+    def blend_started(self) -> bool:
+        cur, plan = self.current, self.plan
+        if plan is None or cur is None:
+            return False
+        return plan.kind == "out" or (self._start_frame is not None and cur.played >= self._start_frame - 10)
+
+    def _call_off_plan(self) -> bool:
+        """Call off a planned transition that has not started (and any being
+        planned). True if one was."""
+        self._gen += 1
+        plan = self.plan
+        if plan is None or self.blend_started():
+            return False
+        incoming, self.incoming = self.incoming, None
+        self.plan, self._start_frame = None, None
+        if incoming:
+            incoming.close()
+        self._queued = self._queued or plan.nxt
+        log_info(f"[records] the {plan.kind} into {plan.nxt.record.name} was called off before it began")
+        self._journal_row({"status": "called_off", "kind": plan.kind, "to": plan.nxt.record.name})
+        return True
+
+    def free_slot(self) -> int:
+        return 3 - self.current.slot if self.current else 2
+
+    def hand_audible(self) -> bool:
+        return self.hand is not None and self._hand_on and self.controls.channel(self.hand.slot)[3] > 1e-3
+
+    def load(self, nxt: Next) -> str:
+        """Put `nxt` on the free deck now, replacing whatever Kaia had lined up
+        there (a blend not yet started is called off). Its channel fader goes
+        down, as a DJ's would; Kaia brings it back up if she mixes it in.
+        "loaded", "after" (a blend into that deck is under way: it can only
+        come after), or "busy" (a deck playing by hand is up on its fader)."""
+        with self._lock:
+            if self.blend_started():
+                return "after"
+            if self.hand_audible():
+                return "busy"
+            self._drop_hand()
+            self._call_off_plan()
+            self._queued, self._exhausted = nxt, False
+            self.cue, self.by_hand = None, True
+            self.controls.set(self.free_slot(), "fader", 0.0)
+        log_action(f"[records] {nxt.record.name} loaded on deck {self.free_slot()} from the booth")
+        return "loaded"
+
+    def default_cue(self, nxt: Optional[Next]) -> float:
+        """Where Kaia would start a record: its bar one, else its first sound."""
+        if nxt is None:
+            return 0.0
+        return nxt.grid.downbeat if nxt.grid and nxt.grid.bar_known else nxt.lead
+
+    @staticmethod
+    def snap(grid, pos: float) -> float:
+        """`pos` on the nearest bar of `grid` (the nearest beat if the bar is not known)."""
+        if grid is None:
+            return max(0.0, pos)
+        step = grid.beat * (4 if grid.bar_known else 1)
+        k = round((pos - grid.downbeat) / step)
+        out = grid.downbeat + k * step
+        return out if out >= 0 else out + step
+
+    def set_cue(self, pos: float) -> bool:
+        """Move the free deck's cue point (snapped to a bar). A deck playing by
+        hand jumps there, back on the beat."""
+        with self._lock:
+            replan = None
+            if self.hand is None and self._queued is None and self.plan is not None and not self.blend_started():
+                # The record on the free deck is already in Kaia's plan (she
+                # plans the end of a record minutes ahead): take it back out,
+                # or the cue was refused and the deck snapped to its start.
+                replan = self.plan.mode
+                self._call_off_plan()
+            nxt = self.hand_next if self.hand is not None else self._queued
+            if nxt is None:
+                return False
+            pos = min(max(0.0, float(pos)), max(0.0, nxt.seconds - 8.0))
+            self.cue = self.snap(nxt.grid, pos)
+            playing = self.hand is not None
+            if playing:
+                self._drop_hand(keep_cue=True)
+            elif not self.blend_started():
+                # A plan made, or being made, from the old cue is called off;
+                # the next one is made from this one, for the same reason.
+                replan = replan or (self.plan.mode if self.plan is not None else None)
+                self._call_off_plan()
+        if playing:
+            self.play_hand()
+        elif replan:
+            self._begin_planning(replan)
+        return True
+
+    def _cued(self, nxt: Next) -> Next:
+        """`nxt` as it comes in from the cue point: bar one at the cue. A cue
+        set at the booth is kept whoever lined the record up."""
+        if self.cue is None:
+            return nxt
+        from utils.audio import beatgrid
+        g = self._grid_at(nxt.record, max(0.0, self.cue - 4.0), 30.0) or nxt.grid
+        # Everything else about the record is kept: rebuilt field by field, its
+        # source was lost, and a record loaded at the booth whose cue had been
+        # moved became one of her picks — swapped for another when it did not lock.
+        if g is None:
+            return replace(nxt, grid=None, lead=self.cue)
+        c = self.snap(g, self.cue)
+        return replace(nxt, grid=beatgrid.Grid(g.bpm, c, g.contrast, bar_known=g.bar_known), lead=c)
+
+    def play_hand(self) -> str:
+        """Start the free deck by hand: at the record on air's tempo where it
+        can be stretched to it, its cue landing on the beat — on the same beat
+        of the bar — of the record on air. Faders do the mixing; it takes over
+        when the record on air has gone quiet. "starting", or "nothing"."""
+        with self._lock:
+            if self.hand is not None or self._hand_starting:
+                return "starting"
+            if self.blend_started():
+                return "nothing"
+            self._call_off_plan()
+            nxt, cur = self._queued, self.current
+            if nxt is None or cur is None:
+                return "nothing"
+            self._hand_starting = True
+            gen = self._gen
+            cue = self.cue if self.cue is not None else self.default_cue(nxt)
+
+        def run():
+            try:
+                self._start_hand(nxt, cur, cue, gen)
+            except Exception as e:
+                log_warning(f"[records] the deck would not start: {e}")
+            finally:
+                self._hand_starting = False
+        threading.Thread(target=run, daemon=True, name="kaia-records-hand").start()
+        return "starting"
+
+    def _semitones(self, playing: Deck, nxt: Next) -> int:
+        from utils.audio.beatgrid import has_rubberband
+        if not self.key_sync or not has_rubberband():
+            return 0
+        return library.key_sync(playing.key, nxt.record.key)
+
+    def _start_hand(self, nxt: Next, cur: Deck, cue: float, gen: int) -> None:
+        global _SOS
+        if _SOS is None:
+            _SOS = _bands()
+        in_g = self._grid_at(nxt.record, max(0.0, cue - 4.0), 30.0) or nxt.grid
+        out_g = self._grid_at(cur.record, max(0.0, cur.at() * cur.ratio - 8.0), 30.0) or cur.grid
+        master_bpm = out_g.bpm * cur.ratio if out_g else None
+        ratio = library.tempo_ratio(master_bpm, in_g.bpm if in_g else nxt.record.bpm)
+        synced = ratio is not None and in_g is not None and out_g is not None
+        ratio = ratio or 1.0
+        c = self.snap(in_g, cue) if in_g else cue
+        phase = None
+        if synced and in_g.bar_known and out_g.bar_known:
+            phase = int(round((c - in_g.downbeat) / in_g.beat)) % 4
+        deck = None
+        for attempt in range(4):
+            lead = 0.8 + 0.5 * attempt
+            if synced and cur.slot not in self.paused:
+                bm, first = out_g.beat / cur.ratio, out_g.downbeat / cur.ratio
+                j = int(np.ceil((cur.at() + lead - first) / bm))
+                while phase is not None and j % 4 != phase:
+                    j += 1
+                when = first + j * bm
+            else:
+                when = cur.at() + lead
+            at = (when - cur.offset / cur.ratio) * RATE + cur.pad
+            k = int(np.floor(at / FRAME_SAMPLES))
+            pad = int(round(at - k * FRAME_SAMPLES))
+            deck = Deck(nxt.record, ratio, nxt.seconds, self._factory, gain=nxt.gain, pad=max(0, pad), offset=c,
+                        semitones=self._semitones(cur, nxt) if synced else 0)
+            deadline = time.time() + 1.0
+            while not deck.ready() and time.time() < deadline:
+                time.sleep(0.02)
+            if (k > cur.played + 1 or cur.slot in self.paused) and deck.ready():
+                break
+            deck.close()
+            deck = None
+        if deck is None:
+            return
+        with self._lock:
+            if gen != self._gen or cur is not self.current or self.hand is not None or self.plan is not None:
+                deck.close()
+                return
+            deck.grid = in_g
+            deck.slot = 3 - cur.slot
+            self.hand, self.hand_next, self.hand_synced = deck, nxt, synced
+            self._hand_k, self._hand_on, self._hand_quiet = k, False, 0
+            self._queued = None
+            self.cue = c
+        log_action(f"[records] {nxt.record.name} played by hand on deck {deck.slot} from {c:.1f}s"
+                   + (f", synced ×{ratio:.4f}" if synced else ", not synced (tempo or beat)"))
+
+    def _drop_hand(self, keep_cue: bool = False) -> None:
+        """Take the deck playing by hand off: back to loaded, cued where it
+        was (or at its cue point)."""
+        hand, nxt, was_on = self.hand, self.hand_next, self._hand_on
+        if hand is None:
+            return
+        pos = hand.at() * hand.ratio
+        self.hand, self.hand_next, self._hand_k, self._hand_on = None, None, None, False
+        self._gen += 1
+        hand.close()
+        if nxt is not None:
+            self._queued, self.by_hand = nxt, True
+            if not keep_cue and was_on:
+                self.cue = min(max(0.0, pos), max(0.0, nxt.seconds - 8.0))
+
+    def stop_hand(self, back_to_cue: bool = False) -> bool:
+        """Pause the deck playing by hand (it holds its place) or, like a
+        CDJ's CUE pressed while playing, stop it back at its cue point."""
+        with self._lock:
+            if self.hand is None:
+                return False
+            self._drop_hand(keep_cue=back_to_cue)
+        return True
+
+    def finish(self) -> bool:
+        """Kaia finishes a mix started by hand: from the next bar the record on
+        air loses its bass and fades out over FINISH_BARS; the faders go back
+        up so nothing she leaves playing is silent."""
+        with self._lock:
+            cur, hand = self.current, self.hand
+            if cur is None or hand is None or self.plan is not None:
+                return False
+            g = cur.grid
+            beat = g.beat / cur.ratio if g else 0.5
+            drop = g.next_bar(cur.at() + 0.3, cur.ratio) if g else cur.at() + 0.3
+            length = max(beat, min(FINISH_BARS * 4 * beat, cur.end - drop - 0.05))
+            nxt = self.hand_next or Next(hand.record, hand.total_frames / FRAMES_PER_S, source="hand")
+            plan = Plan("out", drop, drop, length, beat, hand.ratio, nxt, mode="skip", why="finishing the mix by hand")
+            self.incoming, self.plan = hand, plan
+            self._start_frame = 0 if self._hand_on else self._hand_k
+            self.hand, self.hand_next, self._hand_k, self._hand_on = None, None, None, False
+            for slot in (1, 2):
+                self.controls.set(slot, "fader", 1.0)
+            self.controls.xfader = None
+            self.paused.discard(cur.slot)
+            self.history.append({"ts": time.time(), "kind": "out", "mode": "skip", "from": cur.record.name,
+                                 "to": hand.record.name, "at": round(drop, 2), "ratio": round(hand.ratio, 4),
+                                 "why": plan.why})
+        log_action(f"[records] finishing the hand mix into {hand.record.name} over {length:.1f}s")
+        return True
+
+    def _adopt_hand(self) -> None:
+        """The deck played by hand is the record on air now."""
+        old, hand = self.current, self.hand
+        self._cancel_splice()
+        self._glide_next = self.frames_sent + int(GLIDE_AFTER_BARS * 2 * FRAMES_PER_S)
+        self.current = hand
+        self.hand, self.hand_next, self._hand_k, self._hand_on, self._hand_quiet = None, None, None, False, 0
+        self.cue, self.by_hand = None, False
+        if old is not None:
+            self.paused.discard(old.slot)
+            # The channel the next record comes in on starts flat; centring the
+            # crossfader is silent now that one side is empty.
+            self.controls.channels[old.slot] = Controls._flat()
+            old.close()
+            self.history.append({"ts": time.time(), "kind": "hand", "mode": "hand", "from": old.record.name,
+                                 "to": hand.record.name, "at": round(old.at(), 2), "ratio": round(hand.ratio, 4),
+                                 "why": "mixed by hand"})
+            del self.history[:-50]
+            self._journal_row({"status": "done", "kind": "hand", "from": old.record.name, "to": hand.record.name})
+        self.controls.xfader = None
+        if self._on_change:
+            try:
+                self._on_change(hand.record)
+            except Exception as e:
+                log_debug(f"[records] on_change: {e}")
+        self._prefetch()
+
+    #: The booth's blend lengths, in beats — at 125 bpm about 15 s, 30 s, and
+    #: two minutes, a full minute of it both records up together.
+    BLEND_CHOICES = (32, 64, 256)
+
+    def set_mix_beats(self, beats: int) -> bool:
+        """The length of the next blend (one already planned keeps its own)."""
+        if int(beats) not in self.BLEND_CHOICES:
+            return False
+        with self._lock:
+            self._mix_beats = int(beats)
+            # A blend planned at the old length and not yet begun is planned
+            # again at this one, for the same reason (a skip stays a skip).
+            plan = self.plan
+            if plan is not None and not self.blend_started() and plan.kind == "blend":
+                self._call_off_plan()
+                replan = plan.mode
+            else:
+                replan = None
+        if replan:
+            self._begin_planning(replan)
+        return True
+
+    @staticmethod
+    def _db(frame: Optional[bytes]) -> float:
+        if not frame:
+            return -90.0
+        x = np.frombuffer(frame, dtype=np.int16)[::8].astype(np.float32)
+        rms = float(np.sqrt(np.mean(x * x))) if len(x) else 0.0
+        return round(20 * np.log10(rms / 32768.0), 1) if rms > 1 else -90.0
+
+    def _begin_planning(self, mode: str) -> None:
+        if self._planning or self.plan or self.current is None or self.hand is not None or self._hand_starting:
+            return
+        self._planning = True
+        self.planning_mode = mode
+        deck, gen = self.current, self._gen
+
+        def run():
+            try:
+                deadline = time.time() + 30
+                while self._queued is None and time.time() < deadline:
+                    if not self._picking:
+                        if self._exhausted:
+                            break
+                        self._prefetch()
+                    time.sleep(0.05)
+                nxt = self._queued
+                if nxt is None or deck is not self.current:
+                    return
+                queued = nxt
+                nxt = self._cued(nxt)
+                # Nothing slow may happen on discord.py's audio thread, which
+                # must hand over a frame every 20 ms: the filter (and scipy's
+                # import) is readied here, and the incoming ffmpeg is started
+                # and buffered here, before the plan is published.
+                global _SOS
+                if _SOS is None:
+                    _SOS = _bands()
+                # Where the outgoing's music ends: its last strong beat, a bar
+                # on, not the end of the file. A blend is fitted before it.
+                music_end = _music_end(deck)
+                here = (music_end - 60.0 if mode == "end" else deck.at()) * deck.ratio
+                out_grid = self._grid_at(deck.record, max(0.0, here - 8.0), 45.0)
+                if out_grid is not None:
+                    deck.grid = out_grid                     # measured here, where it is mixed out
+                from utils.audio import setlist
+                verify = self._verify or _default_verify
+                swapped_from = None
+                for attempt in range(4):
+                    lead = 2.0 + attempt                     # room to check the kicks, start ffmpeg, fill
+                    # Every place it could lock, measured: the planned spot, the
+                    # incoming cued at another phrase, the outgoing mixed out
+                    # earlier (a skip: later), a shorter blend.
+                    found = setlist.find_blend(deck.at(), deck.record.path, deck.ratio, out_grid,
+                                               music_end, nxt, mode, self._mix_beats, lead=lead,
+                                               verify_fn=verify, budget_s=SEARCH_S.get(mode, 3.0))
+                    if found is None and attempt == 0 and nxt.source not in ("hand", "request") and self.alternatives:
+                        # Her own pick does not lock anywhere: another record that does.
+                        until = time.time() + ALTERNATIVE_S.get(mode, 6.0)
+                        try:
+                            for alt in self.alternatives(deck, nxt):
+                                if time.time() > until or deck is not self.current or gen != self._gen:
+                                    break
+                                f = setlist.find_blend(deck.at(), deck.record.path, deck.ratio, out_grid, music_end,
+                                                       alt, mode, self._mix_beats, lead=lead, verify_fn=verify,
+                                                       budget_s=max(0.5, until - time.time()))
+                                if f is not None:
+                                    swapped_from, nxt, found = nxt, alt, f
+                                    break
+                        except Exception as e:
+                            log_debug(f"[records] no other record tried: {e}")
+                    if found is not None:
+                        plan = found[0]
+                    else:
+                        # Nothing locks: an echo-out on the bar, never two grooves
+                        # laid over each other and never a bare cut.
+                        plan = plan_transition(deck.at(), deck.ratio, out_grid, music_end, nxt, mode,
+                                               self._mix_beats, lead=lead)
+                        if plan.kind == "blend":             # it fits, but locks nowhere
+                            plan = plan_transition(deck.at(), deck.ratio, out_grid, music_end, nxt, mode,
+                                                   self._mix_beats, lead=lead, allow_blend=False)
+                            plan.check = "no common beat anywhere it could be mixed"
+                        plan = as_echo(plan)
+                    # A stretch that moves onsets early is started that much
+                    # later (only the atempo fallback does; rubberband does not).
+                    from utils.audio.beatgrid import stretch_latency
+                    plan.start += stretch_latency(plan.ratio) - stretch_latency(deck.ratio)
+                    # It starts part-way into its first frame, so its downbeat
+                    # lands on the outgoing bar to the sample.
+                    at = (plan.start - deck.offset / deck.ratio) * RATE + deck.pad   # outgoing samples
+                    k = int(np.floor(at / FRAME_SAMPLES))
+                    pad = int(round(at - k * FRAME_SAMPLES))
+                    incoming = Deck(nxt.record, plan.ratio, nxt.seconds, self._factory,
+                                    gain=nxt.gain, pad=max(0, pad), offset=plan.offset,
+                                    semitones=self._semitones(deck, nxt))
+                    deadline = time.time() + 1.0
+                    while not incoming.ready() and time.time() < deadline:
+                        time.sleep(0.02)
+                    if k > deck.played + 2 and incoming.ready():
+                        break
+                    incoming.close()
+                    incoming = None
+                if incoming is None:
+                    return
+                with self._lock:
+                    if (deck is not self.current or gen != self._gen or self._queued is not queued
+                            or self.hand is not None or self.plan is not None):
+                        incoming.close()
+                        return
+                    incoming.grid = nxt.grid
+                    incoming.slot = 3 - deck.slot
+                    plan.mode = mode
+                    self._queued = None
+                    self._start_frame = k
+                    self.incoming = incoming
+                    self.plan = plan
+
+                why = ""
+                if plan.kind != "blend":
+                    why = ("; the beats don't lock — " + plan.check if plan.fallback == "unlocked" else
+                           "; no clear beat" if not (out_grid and nxt.grid) else
+                           f"; beat not steady enough to blend (contrast {out_grid.contrast:.1f} / "
+                           f"{nxt.grid.contrast:.1f})" if min(out_grid.contrast, nxt.grid.contrast) < BLEND_CONTRAST
+                           else "; bar not found" if not (out_grid.bar_known and nxt.grid.bar_known)
+                           else "; tempos too far apart" if plan.fallback == "tempo"
+                           else "; the beats would drift apart over the blend" if plan.fallback == "drift"
+                           else "; no room left to blend")
+                if swapped_from is not None:
+                    why += f"; {swapped_from.record.name} locked nowhere, so {nxt.record.name} instead"
+                plan.why = why.lstrip("; ")
+                self._journal(deck, nxt, plan, out_grid, music_end, mode)
+                self.history.append({"ts": time.time(), "kind": plan.kind, "mode": mode,
+                                     "from": deck.record.name, "to": nxt.record.name,
+                                     "at": round(plan.drop, 2), "ratio": round(plan.ratio, 4),
+                                     "why": plan.why})
+                del self.history[:-50]
+                shift = (f", key sync {incoming.semitones:+d} ({nxt.record.key} → {incoming.key} against {deck.key})"
+                         if incoming.semitones else "")
+                if self.say:
+                    try:
+                        from utils.audio import dj_voice
+                        if swapped_from is not None:
+                            self.say(dj_voice.swapped(swapped_from.record.title, nxt.record.title), "pick")
+                        self.say(dj_voice.planned(plan, nxt.record.title), "plan")
+                    except Exception as e:
+                        log_debug(f"[records] chatter: {e}")
+                log_action(f"[records] planned: {plan.kind} into {nxt.record.name} at {plan.drop:.2f}s "
+                           f"(stretch {plan.ratio:.4f}, {mode}{why}{shift})")
+            except Exception as e:
+                log_warning(f"[records] transition not planned: {e}")
+            finally:
+                self._planning = False
+                self.planning_mode = None
+        threading.Thread(target=run, daemon=True, name="kaia-records-plan").start()
+
+    def _journal_row(self, row: dict) -> None:
+        try:
+            import json
+            from utils.infrastructure.monitoring.telemetry_paths import telemetry_path
+            path = Path(telemetry_path("memory/records/transitions.jsonl"))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"ts": time.time(), **row}, ensure_ascii=False) + "\n")
+        except Exception as e:
+            log_debug(f"[records] transition not journalled: {e}")
+
+    def _journal(self, deck: Deck, nxt: Next, plan: Plan, out_grid, music_end: float, mode: str) -> None:
+        """Every transition planned, with what it was decided from, in
+        memory/records/transitions.jsonl — the record to read back when a mix
+        sounded wrong. A plan is `planned`; a later row says it was `called_off`
+        or `done`."""
+        try:
+            g = lambda x: {"bpm": round(x.bpm, 3), "contrast": round(x.contrast, 2), "bar_known": x.bar_known,
+                           "downbeat": round(x.downbeat, 3), "bar0": x.bar0} if x else None
+            row = {"status": "planned", "mode": mode, "kind": plan.kind, "why": plan.why, "fallback": plan.fallback,
+                   "from": deck.record.name, "to": nxt.record.name, "out_at": round(deck.at(), 2),
+                   "out_ratio": round(deck.ratio, 5), "drop": round(plan.drop, 3), "length": round(plan.length, 2),
+                   "beats": round(plan.length / plan.beat) if plan.beat else None, "ratio": round(plan.ratio, 5),
+                   "offset": round(plan.offset, 3), "music_end": round(music_end, 2), "file_end": round(deck.end, 2),
+                   "out_grid": g(out_grid), "in_grid": g(nxt.grid), "controls_flat": self.controls.flat(),
+                   "bass_in": nxt.bass_in, "keys": [deck.key, nxt.record.key], "rides": self.rides,
+                   "semitones": self.incoming.semitones if self.incoming else 0, "check": plan.check,
+                   "source": nxt.source}
+            self._journal_row(row)
+        except Exception as e:
+            log_debug(f"[records] transition not journalled: {e}")
+
+    def _fine(self, deck: Deck, plan: Plan) -> Optional[float]:
+        from utils.audio import beatgrid
+        shift = beatgrid.fine_offset(deck.record.path, deck.ratio, plan.drop, plan.nxt.record.path,
+                                     plan.ratio, plan.drop - plan.start + plan.offset / plan.ratio, plan.beat)
+        if shift is not None:
+            log_debug(f"[records] kicks lined up: incoming moved {shift * 1000:+.0f} ms"
+                      + ("" if abs(shift) <= MAX_FINE_S else " (too far to trust; kept the grid's alignment)"))
+        return shift
+
+    def read(self) -> bytes:
+        cur = self.current
+        if cur is None:
+            return b""
+        plan = self.plan
+        # One consistent view per frame: a skip, a load or a cue from the
+        # booth calls a plan off from another thread, and a frame that read
+        # the plan before it and the incoming deck after it dereferenced None.
+        incoming, start_frame = self.incoming, self._start_frame
+        if plan is not None and incoming is None:
+            plan = None
+        # Early enough to fit a blend before a long outro: the plan places
+        # itself on the last phrase that leaves room, however soon it is made.
+        if (plan is None and self.hand is None and not self._planning
+                and cur.remaining <= int((self._mix_beats * 0.6 + 90) * FRAMES_PER_S)):
+            self._begin_planning("end")
+        if self.hand is not None and plan is None:
+            return self._read_hand(cur, self.hand)
+        if cur.slot in self.paused:
+            self.frames_sent += 1
+            self.levels["a"] = self.levels["master"] = -90.0
+            self.meter.append((self.frames_sent, cur.slot, -90.0, -90.0, -90.0))
+            return SILENCE
+        k = cur.played
+        t0 = cur.at(k)
+        out = cur.frame()
+        if self._splice is not None:
+            out, cur = self._splice_frame(cur, k, out)
+            t0 = cur.at(cur.played - 1)
+        elif (plan is None and self.tempo_glide and not self._gliding and not self._planning
+              and self.frames_sent >= self._glide_next and abs(cur.ratio - 1.0) > 0.0015
+              and cur.grid is not None and cur.grid.bar_known
+              and cur.remaining > int((self._mix_beats * 0.6 + 120) * FRAMES_PER_S)):
+            self._begin_glide(cur)
+        if out is None and incoming is None:
+            # Ended with nothing planned: silence while the next is found, or stop.
+            if self._planning or self._picking or self._queued:
+                if not self._planning and self._queued:
+                    self._begin_planning("skip")
+                self.frames_sent += 1
+                return SILENCE
+            cur.close()
+            self.current = None
+            return b""
+        inc = None
+        if (incoming is not None and start_frame is not None and k >= start_frame
+                and incoming.slot not in self.paused):
+            if k == start_frame and self.by_hand and self.controls.channels[incoming.slot]["fader"] <= 0.0:
+                self.controls.set(incoming.slot, "fader", 1.0)    # loaded with its fader down: she brings it in
+            inc = incoming.frame() or SILENCE
+        hands = self.controls
+        solo = SOLO
+        hands_now = (1.0,) * 6
+        if plan is None and self.rides and out is not None and cur.grid is not None:
+            times = t0 + np.arange(FRAME_SAMPLES, dtype=np.float32) / RATE
+            fac, self.gesture = kaia_hands(None, times, self.energy, cur.grid, cur.ratio,
+                                           seed=hash(cur.record.path) & 0xFFFF)
+            hands_now = tuple(round(float(np.asarray(x).reshape(-1)[-1]), 3) for x in fac)
+            if any(float(np.abs(x - 1).max()) > 1e-4 for x in fac[:3]):
+                solo = tuple(fac[:3]) + (0.0, 0.0, 0.0)
+        if plan is None and hands.flat() and solo is SOLO:
+            frame = out
+            self.applied = SOLO
+            self.hands_now = hands_now
+            self.levels["b"] = -90.0
+        elif plan is None:
+            frame = mix_frames(cur.split(out) if out is not None else None, None, solo,
+                               hands.channel(cur.slot), IDENTITY, hands.master)
+            self.applied = tuple(round(float(np.asarray(x).reshape(-1)[-1]), 3) for x in solo)
+            self.hands_now = hands_now
+            self.levels["b"] = -90.0
+        else:
+            times = t0 + np.arange(FRAME_SAMPLES, dtype=np.float32) / RATE
+            g = gains(plan, times)
+            if self.rides:
+                fac, self.gesture = kaia_hands(plan, times, self.energy)
+                g = tuple(a * b for a, b in zip(g, fac))
+                hands_now = tuple(round(float(np.asarray(x).reshape(-1)[-1]), 3) for x in fac)
+            out_parts = cur.split(out) if out is not None else None
+            in_parts = incoming.split(inc) if inc is not None else None
+            frame = mix_frames(out_parts, in_parts, g, hands.channel(cur.slot),
+                               hands.channel(incoming.slot), hands.master)
+            if plan.kind == "echo":
+                self._echo_capture(plan, times, out_parts, hands.channel(cur.slot)[3] * hands.master)
+            self.applied = tuple(round(float(x[-1]), 3) for x in g)
+            self.hands_now = hands_now
+            self.levels["b"] = self._db(inc)
+            if out is None or t0 + FRAME_MS / 1000 >= plan.done:
+                with self._lock:
+                    if self.incoming is incoming and self.plan is plan:
+                        self._advance()
+        if self._echo_tail is not None and frame:
+            frame = self._echo_play(frame)
+        self.levels["a"] = self._db(out)
+        self.levels["master"] = self._db(frame)
+        self.meter.append((self.frames_sent, cur.slot, self.levels["a"], self.levels["b"], self.levels["master"]))
+        self.frames_sent += 1
+        return frame or SILENCE
+
+    # ── the echo-out ────────────────────────────────────────────────
+
+    def _echo_capture(self, plan: Plan, times: np.ndarray, out_parts, level: float) -> None:
+        """Keep the outgoing's last beat before the drop (mids and highs, at the
+        level it was heard); on the frame of the drop, start its repeats."""
+        if self._echo_for is not plan:
+            self._echo_for, self._echo_cap = plan, []
+        if out_parts is not None:
+            keep = (times >= plan.drop - plan.beat) & (times < plan.drop)
+            if keep.any():
+                self._echo_cap.append(((out_parts[1] + out_parts[2]) * level)[keep])
+        if self._echo_cap and float(times[-1]) >= plan.drop and self._echo_tail is None:
+            tail = echo_tail(np.concatenate(self._echo_cap), plan.beat)
+            self._echo_cap = []
+            first = int(np.searchsorted(times, plan.drop))
+            # Index 0 of the tail is the drop: in this frame, `first` samples in.
+            self._echo_tail = np.concatenate([np.zeros((first, 2), dtype=np.float32), tail])
+            self._echo_pos = 0
+
+    def _echo_play(self, frame: bytes) -> bytes:
+        tail, i = self._echo_tail, self._echo_pos
+        chunk = tail[i:i + FRAME_SAMPLES]
+        self._echo_pos = i + FRAME_SAMPLES
+        if self._echo_pos >= len(tail):
+            self._echo_tail = None
+        if not len(chunk):
+            return frame
+        y = np.frombuffer(frame, dtype=np.int16).astype(np.float32).reshape(-1, 2)
+        y[:len(chunk)] += chunk
+        return np.rint(_soft_limit(y)).astype(np.int16).tobytes()
+
+    # ── the tempo glide ─────────────────────────────────────────────
+
+    def _begin_glide(self, cur: Deck) -> None:
+        """Ready the record on air a step nearer its own tempo, to take over on
+        its next bar (off the voice thread)."""
+        from utils.audio.beatgrid import has_rubberband
+        if not has_rubberband():
+            self.tempo_glide = False
+            return
+        self._gliding = True
+
+        def run():
+            try:
+                self._ready_splice(cur)
+            except Exception as e:
+                log_debug(f"[records] tempo glide step not made: {e}")
+            finally:
+                self._gliding = False
+                bar = 4 * cur.grid.beat / cur.ratio
+                self._glide_next = self.frames_sent + int(GLIDE_BARS * bar * FRAMES_PER_S)
+        threading.Thread(target=run, daemon=True, name="kaia-records-glide").start()
+
+    def _ready_splice(self, cur: Deck) -> None:
+        ratio = cur.ratio + max(-GLIDE_STEP, min(GLIDE_STEP, 1.0 - cur.ratio))
+        if abs(ratio - 1.0) < 0.0015:
+            ratio = 1.0
+        when = cur.grid.next_bar(cur.at() + 2.0, cur.ratio)            # on-air seconds
+        own = when * cur.ratio                                          # the record's own seconds there
+        start = max(0.0, own - PREROLL_S)
+        at_cut = (when - cur.offset / cur.ratio) * RATE + cur.pad       # on-air samples
+        at_pre = at_cut - (own - start) / ratio * RATE
+        k_cut = int(np.floor(at_cut / FRAME_SAMPLES))
+        k_pre = int(np.floor(at_pre / FRAME_SAMPLES))
+        new = Deck(cur.record, ratio, cur.end * cur.ratio, self._factory, gain=cur.gain,
+                   pad=int(round(at_pre - k_pre * FRAME_SAMPLES)), offset=start, semitones=cur.semitones)
+        deadline = time.time() + 1.0
+        while not new.ready() and time.time() < deadline:
+            time.sleep(0.02)
+        with self._lock:
+            if (cur is not self.current or self.plan is not None or self.hand is not None or self._planning
+                    or not new.ready() or k_pre <= cur.played + 1):
+                new.close()
+                return
+            new.grid, new.slot = cur.grid, cur.slot
+            self._splice = (new, k_pre, k_cut)
+
+    def _cancel_splice(self) -> None:
+        splice, self._splice = self._splice, None
+        if splice:
+            splice[0].close()
+
+    def _splice_frame(self, cur: Deck, k: int, out: Optional[bytes]) -> tuple:
+        """The frame of the record on air, with a glide step under way: the new
+        decoder runs in unheard from its start frame, and on its frame the two
+        are crossfaded over the 20 ms and the new one is the record on air."""
+        new, k_pre, k_cut = self._splice
+        if self.plan is not None or self.hand is not None or self._planning or out is None:
+            self._cancel_splice()
+            return out, cur
+        if k < k_pre:
+            return out, cur
+        nf = new.frame()
+        if nf is None:
+            self._cancel_splice()
+            return out, cur
+        if k < k_cut:
+            return out, cur
+        a = np.frombuffer(out, dtype=np.int16).astype(np.float32).reshape(-1, 2)
+        b = np.frombuffer(nf, dtype=np.int16).astype(np.float32).reshape(-1, 2)
+        w = np.linspace(0.0, 1.0, FRAME_SAMPLES, dtype=np.float32)[:, None]
+        mixed = np.clip(np.rint(a * (1 - w) + b * w), -32768, 32767).astype(np.int16).tobytes()
+        new._zi = cur._zi                         # the band filters carry on across the join
+        self._splice = None
+        self.current = new
+        cur.close()
+        log_debug(f"[records] tempo glide: {new.record.name} ×{cur.ratio:.4f} → ×{new.ratio:.4f}")
+        return mixed, new
+
+    def _read_hand(self, cur: Deck, hand: Deck) -> bytes:
+        """Both decks open, mixed by the booth's hands: the record on air (unless
+        paused) and the deck played by hand, from its frame on."""
+        cur_paused = cur.slot in self.paused
+        out = None if cur_paused else cur.frame()
+        ended = not cur_paused and out is None
+        if not self._hand_on and (cur_paused or ended or cur.played >= (self._hand_k or 0)):
+            self._hand_on = True
+        hf = hand.frame() if self._hand_on else None
+        if self._hand_on and hf is None:
+            # The hand deck ran out before taking over: it comes off.
+            with self._lock:
+                self._drop_hand()
+            self.frames_sent += 1
+            return out or SILENCE
+        hands = self.controls
+        co, ch = hands.channel(cur.slot), hands.channel(hand.slot)
+        frame = mix_frames(cur.split(out) if out is not None else None,
+                           hand.split(hf) if hf is not None else None, BOTH, co, ch, hands.master)
+        self.applied = BOTH if hf is not None else SOLO
+        self.levels["a"] = self._db(out)
+        self.levels["b"] = self._db(hf)
+        self.levels["master"] = self._db(frame)
+        self.meter.append((self.frames_sent, cur.slot, self.levels["a"], self.levels["b"], self.levels["master"]))
+        if self._hand_on:
+            quiet = ended or cur_paused or co[3] <= 1e-3
+            self._hand_quiet = self._hand_quiet + 1 if quiet else 0
+            if ended or self._hand_quiet >= int(HANDOVER_S * FRAMES_PER_S):
+                with self._lock:
+                    if self.hand is hand:
+                        self._adopt_hand()
+        self.frames_sent += 1
+        return frame
+
+    def _advance(self) -> None:
+        self._cancel_splice()
+        self._glide_next = self.frames_sent + int(GLIDE_AFTER_BARS * 2 * FRAMES_PER_S)
+        if self.plan is not None and self.incoming is not None:
+            self._journal_row({"status": "done", "kind": self.plan.kind, "to": self.incoming.record.name})
+        old, self.current, self.incoming = self.current, self.incoming, None
+        self.plan, self._start_frame = None, None
+        self.cue, self.by_hand = None, False
+        self.gesture = ""
+        if old:
+            old.close()
+        if self.current and self._on_change:
+            try:
+                self._on_change(self.current.record)
+            except Exception as e:
+                log_debug(f"[records] on_change: {e}")
+        self._prefetch()
+
+    def cleanup(self) -> None:
+        self._cancel_splice()
+        for deck in (self.current, self.incoming, self.hand):
+            if deck:
+                deck.close()
+        self.current = self.incoming = self.hand = None
+
+
+class BufferedRecordsSource(_AudioSource):
+    """Keep Discord's 20 ms audio callback to a non-blocking PCM dequeue.
+
+    CrossfadeSource does the actual mixing (band filtering, gain curves and
+    NumPy conversion). Those operations are bounded by CPU/GIL scheduling, so
+    a short pause in analysis or the interpreter used to starve discord.py's
+    voice thread. Render ahead on a worker and keep a small bounded queue of
+    complete 20 ms frames; if the queue is temporarily empty, return silence
+    rather than doing DSP or waiting in the voice callback.
+    """
+
+    def __init__(self, renderer: CrossfadeSource, buffer_frames: int = 15):
+        self.renderer = renderer
+        self.buffer_frames = max(3, min(50, int(buffer_frames)))
+        self._frames: queue.Queue[bytes] = queue.Queue(maxsize=self.buffer_frames)
+        self._stop = threading.Event()
+        self._eof = threading.Event()
+        self._last_read: Optional[float] = None
+        # Keep a bounded sample for diagnostics and separate lifetime counts;
+        # the voice callback must not perform synchronous logging or disk I/O.
+        self.late: deque[float] = deque(maxlen=256)
+        self.late_count = 0
+        self.worst_late = 0.0
+        self.underruns = 0
+        self.jitter_count = 0
+        #: The fewest frames ever waiting when the voice thread asked: how close
+        #: the mixer came to running dry.
+        self.low_water = self.buffer_frames
+        self._thread = threading.Thread(
+            target=self._produce, daemon=True, name="kaia-records-audio-buffer"
+        )
+        self._thread.start()
+
+    def is_opus(self) -> bool:
+        return False
+
+    def _produce(self) -> None:
+        try:
+            while not self._stop.is_set():
+                frame = self.renderer.read()
+                if not frame:
+                    return
+                while not self._stop.is_set():
+                    try:
+                        self._frames.put(frame, timeout=0.05)
+                        break
+                    except queue.Full:
+                        continue
+        except Exception as exc:
+            log_error(f"[records] mixer worker failed: {exc}")
+        finally:
+            self._eof.set()
+
+    def wait_ready(self, frames: int = 5, timeout: float = 2.0) -> bool:
+        """Wait off the event loop for enough initial PCM to avoid a cold start."""
+        wanted = max(1, min(int(frames), self.buffer_frames))
+        deadline = time.monotonic() + max(0.0, timeout)
+        while time.monotonic() < deadline:
+            if self._frames.qsize() >= wanted or self._eof.is_set():
+                break
+            time.sleep(0.005)
+        return self._frames.qsize() >= wanted or self._eof.is_set()
+
+    def read(self) -> bytes:
+        """Return one complete frame immediately; never wait for the mixer."""
+        now = time.perf_counter()
+        if self._last_read is not None and now - self._last_read > JITTER_S:
+            gap = now - self._last_read
+            if gap > LATE_S:
+                self.late.append(gap)
+                self.late_count += 1
+                self.worst_late = max(self.worst_late, gap)
+            else:
+                self.jitter_count += 1
+        self._last_read = now
+        depth = self._frames.qsize()
+        if depth < self.low_water and not self._eof.is_set():
+            self.low_water = depth
+        try:
+            return self._frames.get_nowait()
+        except queue.Empty:
+            if self._eof.is_set() or self._stop.is_set():
+                return b""
+            self.underruns += 1
+            return SILENCE
+
+    def cleanup(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive() and threading.current_thread() is not self._thread:
+            self._thread.join(timeout=0.25)
+        while True:
+            try:
+                self._frames.get_nowait()
+            except queue.Empty:
+                break
+
+
+def _music_end(deck: Deck) -> float:
+    """Where the record's music ends, as played: its last strong beat a bar on,
+    not the end of the file. A blend is fitted before it."""
+    try:
+        from utils.audio import beatgrid as _bg
+        last = _bg.last_strong_beat(deck.record.path, deck.record.bpm, round(deck.end * deck.ratio, 1))
+        if last:
+            return min(deck.end, (last + 240.0 / max(1.0, deck.record.bpm)) / deck.ratio)
+    except Exception as e:
+        log_debug(f"[records] last beat not found: {e}")
+    return deck.end
+
+
+def _out_side(deck: Deck, grid_at: Callable) -> tuple:
+    """(where its music ends, its grid there) — what a blend at its end is planned from."""
+    music_end = _music_end(deck)
+    return music_end, grid_at(deck.record, max(0.0, (music_end - 60.0) * deck.ratio - 8.0), 45.0)
+
+
+def _default_verify(out_path: str, out_ratio: float, in_path: str, plan):
+    from utils.audio import setlist
+    return setlist.verify(out_path, out_ratio, in_path, plan)
+
+
+def _envelope(path: str) -> None:
+    """The record's kick envelope, computed now (it is cached) so measuring a
+    blend at plan time costs milliseconds, not a decode."""
+    try:
+        from utils.audio import mixcheck
+        mixcheck.envelope(path)
+    except Exception as e:
+        log_debug(f"[records] envelope not ready for {path}: {e}")
+
+
+def _default_grid_at(record: library.Record, start: float, seconds: float):
+    """The record's grid round `start`, its bars counted from its first beat."""
+    from utils.audio import beatgrid
+    return beatgrid.grid_at(record.path, record.bpm, start, seconds,
+                            anchor=beatgrid.grid_for(record.path, record.bpm))
+
+
+# ── Sessions ─────────────────────────────────────────────────────────
+
+_sessions: dict[int, "RecordsSession"] = {}
+
+
+def get_records(guild_id: int) -> Optional["RecordsSession"]:
+    return _sessions.get(guild_id)
+
+
+class RecordsSession:
+    def __init__(self, vc, crate: list[library.Record], requested_by: str, text_channel=None,
+                 alone_grace_s: float = 120.0):
+        self.vc = vc
+        self.crate = crate
+        self.requested_by = requested_by
+        self.text_channel = text_channel
+        self.started_at = time.time()
+        self.starved_at_start = DECKS_STARVED
+        self.played: list[str] = []
+        self.names: list[str] = []
+        self.listeners_seen: set[str] = set()
+        self.source: Optional[CrossfadeSource] = None
+        self.voice_source: Optional[BufferedRecordsSource] = None
+        self._alone_grace = alone_grace_s
+        self._closing = False
+        self._task: Optional[asyncio.Task] = None
+        self._rng = random.Random()
+        self.requests: list[str] = []             # paths asked for at the booth, in order
+        # What she says about the set, for the booth (`dj_voice`), newest last.
+        self.chatter: deque = deque(maxlen=40)
+        self._why: dict = {}                      # path -> (edge, in_set) for the record picked next
+        # Which records lock with which, measured (`setlist`), and the set being
+        # played through it. Measured again in the background for anything new.
+        from utils.audio import setlist
+        self._by_path = {r.path: r for r in crate}
+        self.graph = setlist.load()
+        self.set_list: Optional[list] = None
+        if setlist.needs_build(self.graph, crate):
+            setlist.build_in_background(crate, on_done=self._graph_built)
+        self.loading: Optional[str] = None        # a record being readied for the free deck
+        self.last_load: Optional[dict] = None
+
+    @property
+    def guild_id(self) -> int:
+        return self.vc.guild.id
+
+    @property
+    def channel_name(self) -> str:
+        return getattr(self.vc.channel, "name", "voice")
+
+    @property
+    def now(self) -> Optional[library.Record]:
+        return self.source.current.record if self.source and self.source.current else None
+
+    #: How many fitting records are looked at for one that will blend with the
+    #: record on air, before settling for one that can only be switched to.
+    BLEND_TRIES = 20
+
+    def _prepare(self, rec: library.Record) -> Optional[Next]:
+        """A record made ready to come next, whatever its beat: the person
+        asked for it."""
+        from utils.audio import beatgrid
+        seconds = probe_seconds(rec.path)
+        if not seconds or seconds < MIN_RECORD_S:
+            return None
+        beatgrid.ensure_ticks(rec.path, rec.bpm)          # its beats, from the tracker, before its grid
+        _envelope(rec.path)
+        return Next(rec, seconds, gain_db(rec.path), beatgrid.grid_for(rec.path, rec.bpm),
+                    beatgrid.first_sound(rec.path), beatgrid.bass_entry(rec.path, rec.bpm))
+
+    def load(self, rec: library.Record) -> None:
+        """Put `rec` on the free deck, now if it can be (`CrossfadeSource.load`),
+        else next after the blend under way."""
+        self.loading = rec.name
+        try:
+            from utils.audio import dj_voice
+            self.say(dj_voice.hand_load(self.requested_by, rec.title), "hand")
+        except Exception:
+            pass
+
+        def run():
+            try:
+                nxt = self._prepare(rec)
+                src = self.source
+                if nxt is not None:
+                    nxt.source = "hand"
+                if nxt is None or src is None:
+                    log_warning(f"[records] {rec.name} could not be read; not loaded")
+                    self.last_load = {"name": rec.name, "result": "unreadable", "ts": time.time()}
+                    return
+                result = src.load(nxt)
+                if result == "after" and rec.path not in self.requests:
+                    self.requests.append(rec.path)
+                self.last_load = {"name": rec.name, "result": result, "ts": time.time()}
+            finally:
+                self.loading = None
+        threading.Thread(target=run, daemon=True, name="kaia-records-load").start()
+
+    def _choose(self, deck: Deck) -> Optional[Next]:
+        from utils.audio import beatgrid
+        _envelope(deck.record.path)                    # the record on air, measured against at plan time
+        while self.requests:
+            path = self.requests.pop(0)
+            rec = next((r for r in self.crate if r.path == path), None)
+            nxt = self._prepare(rec) if rec else None
+            if nxt:
+                nxt.source = "request"
+                return nxt
+        # Her own pick is a record that will blend with the one on air: a steady
+        # beat, bar one counted, its tempo within stretch of the tempo actually
+        # playing. A pick that could only be switched to was most of the
+        # pedestrian transitions (167 bpm DnB into an 80 bpm pop song).
+        playing = (deck.grid.bpm * deck.ratio) if deck.grid else ((deck.record.bpm or 0) * deck.ratio or None)
+        picked = self._partner(deck)
+        if picked is not None:
+            return picked
+        # Nothing measured from this record: measure candidates against its end
+        # now, as the graph would have, preferring ones with partners of their
+        # own — the way back into the measured sets after a record with none.
+        picked = self._measured_pick(deck)
+        if picked is not None:
+            return picked
+        passed_over: list[str] = []
+        fallback: Optional[Next] = None
+        rec = library.next_record(deck.record, self.crate, self.played, self._rng)
+        for _ in range(self.BLEND_TRIES):
+            if rec is None:
+                break
+            seconds = probe_seconds(rec.path)
+            if not seconds or seconds < MIN_RECORD_S:
+                self.played.append(rec.path)
+            else:
+                grid = beatgrid.grid_for(rec.path, rec.bpm)
+                steady = bool(grid and ((grid.contrast >= BLEND_CONTRAST and grid.bar_known)
+                                        or (grid.tracked and grid.tick_steady(float(grid.ticks[grid.bar_tick])))))
+                blends = steady and bool(library.tempo_ratio(playing, grid.bpm))
+                if blends:
+                    beatgrid.ensure_ticks(rec.path, rec.bpm)
+                    return Next(rec, seconds, gain_db(rec.path), beatgrid.grid_for(rec.path, rec.bpm),
+                                beatgrid.first_sound(rec.path), beatgrid.bass_entry(rec.path, rec.bpm),
+                                source="pick")
+                fallback = fallback or Next(rec, seconds, None, grid, beatgrid.first_sound(rec.path),
+                                            beatgrid.bass_entry(rec.path, rec.bpm), source="pick")
+                passed_over.append(rec.path)
+            rec = library.next_record(deck.record, self.crate, self.played + passed_over, self._rng)
+        # Second pass, over the whole crate: what can be stretched to the tempo
+        # actually playing (a blend can leave a record well off its own), in key
+        # order — the first pass follows the catalog tempo of the record alone.
+        seen = set(self.played) | set(passed_over)
+        pool = [r for r in self.crate if r.path not in seen and r.bpm and library.tempo_ratio(playing, r.bpm)]
+        pool.sort(key=lambda r: ({0: 0, 1: 1, 2: 2}.get(library.key_step(deck.record.key, r.key), 3),
+                                 abs(library.tempo_ratio(playing, r.bpm) - 1.0)))
+        for rec in pool[:self.BLEND_TRIES]:
+            seconds = probe_seconds(rec.path)
+            if not seconds or seconds < MIN_RECORD_S:
+                continue
+            grid = beatgrid.grid_for(rec.path, rec.bpm)
+            if grid and ((grid.contrast >= BLEND_CONTRAST and grid.bar_known)
+                         or (grid.tracked and grid.tick_steady(float(grid.ticks[grid.bar_tick])))):
+                beatgrid.ensure_ticks(rec.path, rec.bpm)
+                return Next(rec, seconds, gain_db(rec.path), beatgrid.grid_for(rec.path, rec.bpm),
+                            beatgrid.first_sound(rec.path), beatgrid.bass_entry(rec.path, rec.bpm),
+                            source="pick")
+        if fallback is not None:
+            log_info(f"[records] nothing in {self.BLEND_TRIES} candidates blends with {deck.record.name}; "
+                     f"{fallback.record.name} will be switched to on the bar")
+            try:
+                from utils.audio import dj_voice
+                self.say(dj_voice.chose_next(deck.record, fallback.record, None, False), "pick")
+            except Exception:
+                pass
+            fallback.gain = gain_db(fallback.record.path)
+        return fallback
+
+    def _graph_built(self, graph: dict) -> None:
+        self.graph = graph
+
+    def play_set(self, index: int) -> Optional[tuple]:
+        """Follow set `index` (of `setlist.live_sets`) from here on: its first
+        record not yet played comes next — measured live like any blend — and
+        each one after it is the set's next. (record name, already on air), or None."""
+        from utils.audio import setlist
+        sets = setlist.live_sets(self.graph, self.crate)
+        if not 0 <= index < len(sets):
+            return None
+        self.set_list = sets[index]
+        on_air = self.now.path if self.now else None
+        if on_air in self.set_list:
+            log_action(f"[records] set {index + 1} chosen at the booth; already in it")
+            return self._by_path[on_air].name, True
+        played = set(self.played)
+        first = next((p for p in self.set_list if p not in played), self.set_list[0])
+        self.requests = [first] + [p for p in self.requests if p != first]
+        src = self.source
+        if src is not None and src.hand is None:
+            # The next record changed: a plan not yet begun is called off, the
+            # pick waiting (or still being made) is dropped, and the set's
+            # record is picked now. A blend already under way finishes first.
+            with src._lock:
+                if not src.blend_started():
+                    src._call_off_plan()
+                    src._gen += 1
+                    src._queued = None
+                    src._exhausted = False
+            src._prefetch()
+        log_action(f"[records] set {index + 1} chosen at the booth; {self._by_path[first].name} comes next")
+        try:
+            from utils.audio import dj_voice
+            bpms = [self._by_path[p].bpm for p in self.set_list if self._by_path[p].bpm]
+            self.say(dj_voice.set_started(index + 1, len(self.set_list), min(bpms), max(bpms)), "set")
+        except Exception:
+            pass
+        return self._by_path[first].name, False
+
+    def _partner(self, deck: Deck) -> Optional[Next]:
+        """The next record from the measured graph (`setlist`): the next one in
+        the set being played if it is a measured lock from this one, else the
+        partner that sits best in key and has the most partners of its own."""
+        from utils.audio import beatgrid, setlist
+        try:
+            nbrs = setlist.partners(self.graph, deck.record.path)
+        except Exception:
+            return None
+        played = set(self.played)
+        heard = [self._by_path[p] for p in played if p in self._by_path] + [deck.record]
+        options = [p for p in nbrs if p not in played and p in self._by_path
+                   and not any(library.same_song(self._by_path[p], h) for h in heard)]
+        if not options:
+            return None
+        if self.set_list and deck.record.path in self.set_list:
+            i = self.set_list.index(deck.record.path)
+            ahead = [p for p in self.set_list[i + 1:] if p not in played]
+            if ahead and ahead[0] in options:
+                options = [ahead[0]]
+        else:
+            self.set_list = next((s for s in self.graph.get("sets", []) if deck.record.path in s), self.set_list)
+        onward = lambda p: len([x for x in setlist.partners(self.graph, p) if x not in played])
+        # How long the pair can blend counts with the key, as it does in the sets.
+        options.sort(key=lambda p: (setlist.blend_rank(nbrs.get(p))
+                                    + {0: 0, 1: 0, 2: 1}.get(library.key_step(deck.record.key, self._by_path[p].key), 2),
+                                    -min(onward(p), 6), self._rng.random()))
+        for path in options[:4]:
+            rec = self._by_path[path]
+            seconds = probe_seconds(rec.path)
+            if not seconds or seconds < MIN_RECORD_S:
+                continue
+            beatgrid.ensure_ticks(rec.path, rec.bpm)
+            _envelope(rec.path)
+            log_info(f"[records] next: {rec.name} — measured to lock with {deck.record.name}")
+            try:
+                from utils.audio import dj_voice
+                self.say(dj_voice.chose_next(deck.record, rec, nbrs.get(path),
+                                             bool(self.set_list and path in self.set_list)), "pick")
+            except Exception as e:
+                log_debug(f"[records] chatter: {e}")
+            return Next(rec, seconds, gain_db(rec.path), beatgrid.grid_for(rec.path, rec.bpm),
+                        beatgrid.first_sound(rec.path), beatgrid.bass_entry(rec.path, rec.bpm),
+                        source="set" if self.set_list and path in self.set_list else "partner")
+        return None
+
+    #: Records measured against the one on air when the graph has nothing for
+    #: it (`_measured_pick`), and how long that may take (it runs while the
+    #: record plays, minutes before it ends).
+    SEARCH_TRIES = 16
+    SEARCH_BUDGET_S = 40.0
+
+    def _candidates(self, deck: Deck, exclude: Optional[library.Record] = None) -> list:
+        """Records that could follow `deck`, best first: its measured partners,
+        then anything within stretch of the tempo playing, by key and genre —
+        each not played (nor another file of a song played), and those with
+        measured partners of their own ahead of those without."""
+        from utils.audio import beatgrid, setlist
+        played = set(self.played)
+        heard = [self._by_path[p] for p in played if p in self._by_path] + [deck.record]
+        playing = (deck.grid.bpm * deck.ratio) if deck.grid else ((deck.record.bpm or 0) * deck.ratio or None)
+
+        def fresh(r):
+            return (r.path not in played and r.bpm and (exclude is None or not library.same_song(r, exclude))
+                    and not any(library.same_song(r, h) for h in heard))
+        nbrs = setlist.partners(self.graph, deck.record.path)
+        first = [self._by_path[p] for p in sorted(nbrs, key=lambda p: -nbrs[p].get("agree", 0))
+                 if p in self._by_path and fresh(self._by_path[p])]
+        onward = lambda r: len(setlist.partners(self.graph, r.path))
+        rest = [r for r in self.crate if fresh(r) and r not in first and library.tempo_ratio(playing, r.bpm)
+                and beatgrid.ticks_for(r.path) is not None]
+        rest.sort(key=lambda r: (onward(r) == 0, -library.score(deck.record, r), self._rng.random()))
+        return first + rest
+
+    def _alternatives(self, deck: Deck, rejected: Next):
+        """Readied records to try when `rejected` will not lock with `deck`."""
+        nbrs = None
+        for rec in self._candidates(deck, exclude=rejected.record)[:self.SEARCH_TRIES]:
+            nxt = self._prepare(rec)
+            if nxt is None:
+                continue
+            if nbrs is None:
+                from utils.audio import setlist
+                nbrs = setlist.partners(self.graph, deck.record.path)
+            nxt.source = "partner" if rec.path in nbrs else "search"
+            yield nxt
+
+    def _measured_pick(self, deck: Deck) -> Optional[Next]:
+        """A record measured to lock with `deck` where it ends, found now."""
+        from utils.audio import beatgrid, setlist
+        started = time.time()
+        try:
+            music_end, out_grid = _out_side(deck, self.source._grid_at if self.source else _default_grid_at)
+        except Exception as e:
+            log_debug(f"[records] the end of {deck.record.name} not read: {e}")
+            return None
+        if out_grid is None:
+            return None
+        for nxt in self._alternatives(deck, Next(deck.record, 0.0)):
+            if time.time() - started > self.SEARCH_BUDGET_S:
+                break
+            found = setlist.find_blend(max(deck.at(), music_end - 180.0), deck.record.path, deck.ratio, out_grid,
+                                       music_end, nxt, "end", self.source._mix_beats if self.source else MIX_BEATS,
+                                       budget_s=max(1.0, self.SEARCH_BUDGET_S - (time.time() - started)))
+            if found is None:
+                continue
+            plan, verdict, shift, how = found
+            edge = {"ms": round(shift * 1000, 1), "agree": verdict.agree, "bars": verdict.bars,
+                    "ratio": round(plan.ratio, 5), **how}
+            self.graph.setdefault("edges", {}).setdefault(deck.record.path, {})[nxt.record.path] = edge
+            log_info(f"[records] next: {nxt.record.name} — measured just now to lock with {deck.record.name}")
+            try:
+                from utils.audio import dj_voice
+                self.say(dj_voice.chose_next(deck.record, nxt.record, edge, False), "pick")
+            except Exception as e:
+                log_debug(f"[records] chatter: {e}")
+            nxt.source = "search"
+            return nxt
+        return None
+
+    def say(self, text: str, kind: str = "") -> None:
+        if text:
+            self.chatter.append({"ts": time.time(), "text": text, "kind": kind})
+
+    def _changed(self, record: library.Record) -> None:
+        self.played.append(record.path)
+        self.names.append(record.name)
+        try:
+            from utils.audio import dj_voice
+            pos = None
+            if self.set_list and record.path in self.set_list:
+                pos = (self.set_list.index(record.path) + 1, len(self.set_list))
+            self.say(dj_voice.now_playing(record, set_pos=pos), "now")
+        except Exception as e:
+            log_debug(f"[records] chatter: {e}")
+        log_action(f"[records] now playing {record.name} ({record.bpm or '?'} bpm, {record.key or '?'})")
+
+    def _humans(self) -> list[str]:
+        return [m.display_name for m in getattr(self.vc.channel, "members", []) if not m.bot]
+
+    def _feel(self) -> None:
+        """Her energy for the mixer, from her mood (arousal and energy)."""
+        try:
+            from utils.core.kaia_art_intent import mood
+            m = mood() or {}
+            vals = [float(m[k]) for k in ("arousal", "energy") if isinstance(m.get(k), (int, float))]
+            if vals and self.source is not None:
+                self.source.energy = min(1.0, max(0.0, sum(vals) / len(vals)))
+        except Exception as e:
+            log_debug(f"[records] mood not read: {e}")
+
+    async def _watch(self) -> None:
+        alone_since = None
+        await asyncio.to_thread(self._feel)
+        while not self._closing:
+            await asyncio.sleep(15)
+            await asyncio.to_thread(self._feel)
+            people = self._humans()
+            self.listeners_seen.update(people)
+            if people:
+                alone_since = None
+            elif alone_since is None:
+                alone_since = time.time()
+            elif time.time() - alone_since >= self._alone_grace:
+                log_action("[records] the channel emptied; stopping.")
+                await self.stop()
+                return
+            if not self.vc.is_playing() and not self._closing:
+                await self.stop()
+                return
+
+    def skip(self) -> None:
+        self.after_load(lambda: self.source.skip() if self.source else None)
+
+    def after_load(self, fn) -> None:
+        """Run `fn` now, or once a record being loaded at the booth is on the
+        deck. Loading reads the record first (its beats, its loudness), which
+        can take seconds; a NEXT pressed meanwhile planned with nothing loaded
+        and mixed in her own pick."""
+        if not self.loading:
+            fn()
+            return
+
+        def wait():
+            deadline = time.time() + LOAD_WAIT_S
+            while self.loading and time.time() < deadline:
+                time.sleep(0.05)
+            fn()
+        threading.Thread(target=wait, daemon=True, name="kaia-records-after-load").start()
+
+    async def stop(self, disconnect: bool = True) -> None:
+        """End the set. `disconnect=False` when something else is taking the
+        voice connection over (radio, a live set)."""
+        if self._closing:
+            return
+        self._closing = True
+        _sessions.pop(self.guild_id, None)
+        try:
+            if self.vc.is_playing():
+                self.vc.stop()
+        except Exception as e:
+            log_debug(f"[records] stop playback: {e}")
+        if self.voice_source:
+            self.voice_source.cleanup()
+        if self.source:
+            self.source.cleanup()
+        if disconnect:
+            try:
+                await self.vc.disconnect(force=True)
+            except Exception as e:
+                log_debug(f"[records] disconnect: {e}")
+        if self._task and not self._task.done() and self._task is not asyncio.current_task():
+            self._task.cancel()
+        # The booth window stays open when the set ends: it shows "no set
+        # running" until the next !music records, which uses it again.
+        minutes = (time.time() - self.started_at) / 60
+        late_count = self.voice_source.late_count if self.voice_source else 0
+        worst_late = self.voice_source.worst_late if self.voice_source else 0.0
+        underruns = self.voice_source.underruns if self.voice_source else 0
+        details = []
+        if late_count:
+            details.append(f"voice callback late {late_count} times, worst {worst_late * 1000:.0f} ms")
+        if underruns:
+            details.append(f"{underruns} PCM buffer underruns")
+        vs = self.voice_source
+        starved = DECKS_STARVED - getattr(self, "starved_at_start", DECKS_STARVED)
+        if starved:
+            details.append(f"decoders behind for {starved} frames ({starved * 20} ms of silence)")
+        tail = (f" {getattr(vs, 'jitter_count', 0)} gaps of {JITTER_S * 1000:.0f}–{LATE_S * 1000:.0f} ms; the "
+                f"buffer never fell below {getattr(vs, 'low_water', '?')} of {getattr(vs, 'buffer_frames', '?')} "
+                f"frames.") if vs else ""
+        log_action(f"[records] set ended after {minutes:.1f} min, {len(self.names)} records; "
+                   + ("; ".join(details) if details else "no late frames or buffer underruns") + "." + tail)
+        self._remember(minutes)
+
+    def _remember(self, minutes: float) -> None:
+        if minutes < 1 or not self.names:
+            return
+        try:
+            from utils.core.kaia_expression import remember
+            crowd = sorted(self.listeners_seen - {self.requested_by})
+            who = ", ".join(([self.requested_by] if self.requested_by else []) + crowd[:5])
+            some = ", ".join(self.names[:3]) + ("…" if len(self.names) > 3 else "")
+            remember("music",
+                     f"[i played records in {self.channel_name} for {minutes:.0f} minutes — "
+                     f"{len(self.names)} of them, starting with {some}"
+                     f"{'; ' + who + ' listened' if who else ''}.]",
+                     channel_id=getattr(self.text_channel, "id", None),
+                     title="a records set",
+                     detail={"kind": "records", "minutes": round(minutes, 1), "records": self.names,
+                             "listeners": sorted(self.listeners_seen)})
+        except Exception as e:
+            log_debug(f"[records] set not remembered: {e}")
+
+    def stats(self) -> dict:
+        q = self.source._queued if self.source else None
+        nxt = q.record.name if q else (self.source.incoming.record.name if self.source and self.source.incoming else None)
+        now = self.now
+        return {"now": now.name if now else None, "bpm": now.bpm if now else None,
+                "key": now.key if now else None, "genre": now.genre if now else None,
+                "next": nxt, "played": len(self.names), "channel": self.channel_name,
+                "uptime_min": round((time.time() - self.started_at) / 60), "listeners": len(self._humans())}
+
+
+class AlreadyStarting(RuntimeError):
+    """A records start is already under way in this guild."""
+
+
+_starting: set[int] = set()
+
+
+async def start_records(channel, crate: list[library.Record], first: library.Record, **kw) -> RecordsSession:
+    """Join `channel` and start the set at `first`. Stops whatever was playing there.
+
+    One start at a time per guild: two overlapping starts share one voice
+    client, and the one that fails tears it down under the one that played."""
+    guild_id = channel.guild.id
+    if guild_id in _starting:
+        raise AlreadyStarting()
+    _starting.add(guild_id)
+    try:
+        return await _start_records(channel, crate, first, **kw)
+    finally:
+        _starting.discard(guild_id)
+
+
+async def _start_records(channel, crate: list[library.Record], first: library.Record, *,
+                         requested_by: str, text_channel=None, mix_beats: int = MIX_BEATS,
+                         alone_grace_s: float = 120.0, set_list: Optional[list] = None) -> RecordsSession:
+    guild = channel.guild
+    if (old := _sessions.get(guild.id)):
+        await old.stop()
+    try:
+        from utils.audio.strudel_session import get_session
+        if (synth := get_session(guild.id)):
+            await synth.stop()
+    except Exception as e:
+        log_debug(f"[records] no live set to stop: {e}")
+    try:
+        from utils.radio import live
+        await live.free_voice(guild)
+    except Exception as e:
+        log_debug(f"[records] radio not stopped: {e}")
+
+    seconds = await asyncio.to_thread(probe_seconds, first.path)
+    if not seconds:
+        raise RuntimeError(f"could not read {first.name}")
+    if not discord.opus.is_loaded():
+        try:
+            discord.opus._load_default()
+        except Exception as exc:
+            raise RuntimeError("libopus is not loaded") from exc
+
+    vc = guild.voice_client
+    if vc and vc.is_connected():
+        await vc.move_to(channel)
+    else:
+        vc = await channel.connect(timeout=30.0, reconnect=True)
+
+    session = RecordsSession(vc, crate, requested_by, text_channel, alone_grace_s)
+
+    session.set_list = set_list
+    deck = Deck(first, 1.0, seconds, gain=await asyncio.to_thread(gain_db, first.path))
+    from utils.audio import beatgrid
+    await asyncio.to_thread(beatgrid.ensure_ticks, first.path, first.bpm)
+    deck.grid = await asyncio.to_thread(beatgrid.grid_for, first.path, first.bpm)
+    if set_list and first.path == set_list[0]:
+        try:
+            from utils.audio import dj_voice
+            bpms = [r.bpm for r in crate if r.path in set_list and r.bpm]
+            session.say(dj_voice.set_started(None, len(set_list), min(bpms), max(bpms)), "set")
+        except Exception as e:
+            log_debug(f"[records] chatter: {e}")
+    session._changed(first)
+    session.source = CrossfadeSource(deck, session._choose, on_change=session._changed,
+                                     mix_beats=int(mix_beats))
+    session.source.say = session.say
+    session.source.alternatives = session._alternatives
+    try:
+        from utils.infrastructure.system.yaml_config import config
+        session.source.rides = bool(config.get("music.records_kaia_hands", True))
+        session.source.key_sync = bool(config.get("music.records_key_sync", True))
+        session.source.tempo_glide = bool(config.get("music.records_tempo_glide", True))
+    except Exception as e:
+        log_debug(f"[records] records_kaia_hands not read: {e}")
+    # The first record's decoder has to be ahead before the voice thread
+    # starts asking: a set started while it was still spinning up (rubberband,
+    # a busy machine) opened on frames of silence.
+    await asyncio.to_thread(_wait_deck, deck, FIRST_DECK_FRAMES, 3.0)
+    settle("a records set")
+    from utils.infrastructure.system.yaml_config import config
+    buffer_frames = int(config.get("music.records_audio_buffer_frames", 15))
+    session.voice_source = BufferedRecordsSource(session.source, buffer_frames=buffer_frames)
+    # Warm the renderer's first few frames before starting Discord's voice thread.
+    # This keeps first-use imports/filter setup outside the 20 ms callback.
+    primed = await asyncio.to_thread(session.voice_source.wait_ready, min(5, session.voice_source.buffer_frames), 2.0)
+    if not primed:
+        log_warning("[records] PCM buffer did not prime before playback; starting with underrun protection")
+    try:
+        vc.play(session.voice_source, after=lambda e: log_error(f"[records] playback error: {e}") if e else None,
+                signal_type=OPUS_SIGNAL)
+    except BaseException:
+        # The deck, mixer, and PCM producer already own threads/processes at
+        # this point, but the session is not registered until play succeeds.
+        # Tear those down and release the voice connection before propagating
+        # the original startup error to the command handler.
+        if session.voice_source:
+            try:
+                session.voice_source.cleanup()
+            except Exception as cleanup_exc:
+                log_debug(f"[records] startup PCM cleanup failed: {cleanup_exc}")
+        if session.source:
+            try:
+                session.source.cleanup()
+            except Exception as cleanup_exc:
+                log_debug(f"[records] startup mixer cleanup failed: {cleanup_exc}")
+        else:
+            try:
+                deck.close()
+            except Exception as cleanup_exc:
+                log_debug(f"[records] startup deck cleanup failed: {cleanup_exc}")
+        try:
+            if vc.is_connected():
+                await vc.disconnect(force=True)
+        except Exception as cleanup_exc:
+            log_debug(f"[records] startup voice disconnect failed: {cleanup_exc}")
+        raise
+    _sessions[guild.id] = session
+    try:
+        from utils.audio import dj_dashboard
+        await asyncio.to_thread(dj_dashboard.serve)
+        session._booth = asyncio.create_task(asyncio.to_thread(dj_dashboard.open_window))
+        session._booth.add_done_callback(
+            lambda t: t.cancelled() or not t.exception() or log_warning(f"[records] DJ booth window: {t.exception()}"))
+    except Exception as e:
+        log_debug(f"[records] DJ booth not opened: {e}")
+    from utils.infrastructure.monitoring.async_task_registry import task_registry
+    session._task = asyncio.create_task(session._watch())
+    task_registry.register(f"records_watch_{guild.id}", session._task)
+    return session
+
+
+async def stop_all() -> None:
+    for s in list(_sessions.values()):
+        try:
+            await s.stop()
+        except Exception as e:
+            log_debug(f"[records] stop_all: {e}")
