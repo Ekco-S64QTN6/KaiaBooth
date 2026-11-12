@@ -55,12 +55,45 @@ def test_blend_length_does_not_outweigh_a_bad_key_by_itself():
     assert setlist.blend_rank({}) == setlist.blend_rank({"beats": 16})
 
 
+def test_set_builder_widens_beyond_five_dead_ends_to_find_a_full_set():
+    """The sixth-ranked edge is the only route to a set above SET_MIN_S."""
+    live = {}
+
+    def add(name):
+        path = f"/m/{name}.mp3"
+        rec = Record(path, f"Artist {name}", name, 124.0, "8A", "house")
+        live[path] = rec
+        return rec
+
+    start = add("Start")
+    dead_ends = [add(f"Dead{i}") for i in range(5)]
+    viable = [add(f"Viable{i}") for i in range(8)]
+
+    long_edge = {"beats": 64, "back": 0, "cue": 0, "agree": 16}
+    short_edge = {"beats": 16, "back": 0, "cue": 0, "agree": 4}
+    edges = {start.path: {r.path: dict(long_edge) for r in dead_ends}}
+    # This valid route ranks sixth because its first measured blend is shorter.
+    edges[start.path][viable[0].path] = dict(short_edge)
+    for a, b in zip(viable, viable[1:]):
+        edges[a.path] = {b.path: dict(long_edge)}
+
+    graph = {
+        "records": {path: {"seconds": 500.0} for path in live},
+        "edges": edges,
+    }
+    sets = setlist.make_sets(graph, live, random.Random(1))
+
+    assert sets
+    assert sets[0][0] == start.path
+    assert viable[0].path in sets[0]
+    assert len(sets[0]) >= 7
+
 
 def test_selection_rank_prefers_exact_style_before_family_neighbours():
-    current = Record("/m/current.mp3", "First Artist", "Current", 124.0, "8A", "House")
-    exact = Record("/m/exact.mp3", "Second Artist", "Exact", 124.0, "8A", "House")
-    disco = Record("/m/disco.mp3", "Third Artist", "Disco", 124.0, "8A", "Disco")
-    techno = Record("/m/techno.mp3", "Fourth Artist", "Techno", 124.0, "8A", "Techno")
+    current = Record("/m/current.mp3", "Alpha", "Current", 124.0, "8A", "House")
+    exact = Record("/m/exact.mp3", "Beta", "Exact", 124.0, "8A", "House")
+    disco = Record("/m/disco.mp3", "Gamma", "Disco", 124.0, "8A", "Disco")
+    techno = Record("/m/techno.mp3", "Delta", "Techno", 124.0, "8A", "Techno")
     edge = {"beats": 64, "agree": 14, "bars": 16, "ratio": 1.0}
 
     exact_rank = setlist.transition_rank(current, exact, edge, history=[current])
@@ -70,9 +103,9 @@ def test_selection_rank_prefers_exact_style_before_family_neighbours():
 
 
 def test_selection_rank_softly_prefers_artist_variety():
-    current = Record("/m/current.mp3", "First Artist", "Current", 124.0, "8A", "House")
-    fresh = Record("/m/fresh.mp3", "Second Artist", "Fresh", 124.0, "8A", "House")
-    repeat = Record("/m/repeat.mp3", "First Artist", "Repeat", 124.0, "8A", "House")
+    current = Record("/m/current.mp3", "Alpha", "Current", 124.0, "8A", "House")
+    fresh = Record("/m/fresh.mp3", "Beta", "Fresh", 124.0, "8A", "House")
+    repeat = Record("/m/repeat.mp3", "Alpha", "Repeat", 124.0, "8A", "House")
     edge = {"beats": 64, "agree": 14, "bars": 16, "ratio": 1.0}
 
     assert setlist.transition_rank(current, fresh, edge, history=[current]) < setlist.transition_rank(
@@ -83,10 +116,10 @@ def test_selection_rank_softly_prefers_artist_variety():
 
 
 def test_selection_rank_uses_agreement_fraction_not_raw_count():
-    current = Record("/m/current.mp3", "First Artist", "Current", 124.0, "8A", "House")
+    current = Record("/m/current.mp3", "Alpha", "Current", 124.0, "8A", "House")
     wide_low_confidence = {"beats": 128, "agree": 20, "bars": 32, "ratio": 1.0}
     shorter_high_confidence = {"beats": 64, "agree": 14, "bars": 16, "ratio": 1.0}
-    candidate = Record("/m/candidate.mp3", "Second Artist", "Candidate", 124.0, "8A", "House")
+    candidate = Record("/m/candidate.mp3", "Beta", "Candidate", 124.0, "8A", "House")
 
     assert setlist.blend_rank(wide_low_confidence) == setlist.blend_rank(shorter_high_confidence)
     assert setlist.transition_rank(current, candidate, shorter_high_confidence) < setlist.transition_rank(
@@ -94,10 +127,74 @@ def test_selection_rank_uses_agreement_fraction_not_raw_count():
     )
 
 
+def test_selection_rank_keeps_the_existing_key_and_blend_tradeoff():
+    current = Record("/m/current.mp3", "Alpha", "Current", 124.0, "8A", "House")
+    same_key = Record("/m/same-key.mp3", "Beta", "Same key", 124.0, "8A", "House")
+    two_steps = Record("/m/two-steps.mp3", "Gamma", "Two steps", 124.0, "10A", "House")
+    short = {"beats": 32, "agree": 8, "bars": 8, "ratio": 1.0}
+    long = {"beats": 64, "agree": 14, "bars": 16, "ratio": 1.0}
+
+    assert setlist.transition_rank(current, same_key, short) < setlist.transition_rank(current, two_steps, long)
+
+
+def test_artist_matching_ignores_compilation_placeholders():
+    from utils.audio import library
+    various = Record("/m/various.mp3", "Various Artists", "Compilation", 124.0, "8A", "House")
+    named = Record("/m/named.mp3", "Beta", "Named", 124.0, "8A", "House")
+    assert not library.shares_artist(various, named)
+
+
 def test_set_method_upgrade_rebuilds_sets_without_invalidating_audio_edges():
-    graph = {"method": setlist.METHOD, "sets_method": setlist.SET_METHOD - 1,
-             "records": {}, "edges": {}, "checked": {}}
+    graph = {
+        "method": setlist.METHOD,
+        "sets_method": setlist.SET_METHOD - 1,
+        "records": {},
+        "edges": {},
+        "checked": {},
+    }
     assert setlist.needs_build(graph, [])
     assert setlist.pending(graph, []) == {"records": 0, "pairs": 0}
     graph["sets_method"] = setlist.SET_METHOD
     assert not setlist.needs_build(graph, [])
+
+
+def test_peeking_a_set_does_not_consume_rotation(tmp_path, monkeypatch):
+    from utils.audio.library import Record
+
+    path = tmp_path / "set_rotation.json"
+    monkeypatch.setattr(setlist, "_rotation_path", lambda: path)
+    crate = [
+        Record(f"/m/{i}.mp3", "Artist", f"Track {i}", 124.0, "8A", "House")
+        for i in range(8)
+    ]
+    graph = {"sets": [
+        [r.path for r in crate[:4]],
+        [r.path for r in crate[4:]],
+    ]}
+
+    first = setlist.peek_next_set(graph, crate)
+    assert first == [r.path for r in crate[:4]]
+    assert setlist.peek_next_set(graph, crate) == first
+    assert not path.exists(), "peeking must not write/advance rotation"
+
+    assert setlist.advance_rotation(graph, crate) is True
+    assert setlist.peek_next_set(graph, crate) == [r.path for r in crate[4:]]
+    assert setlist.advance_rotation(graph, crate) is True
+    assert setlist.peek_next_set(graph, crate) == first
+
+
+def test_legacy_next_set_still_selects_and_advances(tmp_path, monkeypatch):
+    from utils.audio.library import Record
+
+    path = tmp_path / "set_rotation.json"
+    monkeypatch.setattr(setlist, "_rotation_path", lambda: path)
+    crate = [
+        Record(f"/m/{i}.mp3", "Artist", f"Track {i}", 124.0, "8A", "House")
+        for i in range(8)
+    ]
+    graph = {"sets": [
+        [r.path for r in crate[:4]],
+        [r.path for r in crate[4:]],
+    ]}
+    assert setlist.next_set(graph, crate) == [r.path for r in crate[:4]]
+    assert setlist.peek_next_set(graph, crate) == [r.path for r in crate[4:]]

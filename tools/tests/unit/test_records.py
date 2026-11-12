@@ -262,8 +262,18 @@ def test_the_set_ends_when_nothing_comes_next():
     first = Deck(rec("one", 124, "8A"), 1.0, 0.4, tone(500, 0.4))
     src = CrossfadeSource(first, lambda deck: None, grid_at=lambda *a: None)
     wait_for(first, 20)
-    frames = [src.read() for _ in range(60)]
-    assert b"" in frames
+    # This is an EOF-only test: wait for the explicit no-next result rather
+    # than letting a speculative end planner race the synthetic frame loop.
+    deadline = time.monotonic() + 1.0
+    while src._picking and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert not src._picking and src._exhausted
+    src._begin_planning = lambda _mode: None
+    try:
+        frames = [src.read() for _ in range(60)]
+        assert b"" in frames
+    finally:
+        src.cleanup()
 
 
 def test_a_quiet_record_is_raised_but_never_past_its_peak(tmp_path):
@@ -934,6 +944,8 @@ def test_next_pressed_while_a_booth_load_is_reading_waits_for_it():
     from types import SimpleNamespace
     calls = []
     session = R.RecordsSession.__new__(R.RecordsSession)
+    session._load_lock = threading.Lock()
+    session._closing = False
     session.loading = "Cam Wales — Ambulance"
     session.source = SimpleNamespace(skip=lambda: calls.append(("skip", session.loading)))
     session.skip()
@@ -1041,25 +1053,474 @@ def test_a_set_waits_for_its_first_record_to_buffer():
 
 
 
+
+def _load_race_session():
+    import threading
+    from types import SimpleNamespace
+
+    session = R.RecordsSession.__new__(R.RecordsSession)
+    session._closing = False
+    session._load_lock = threading.Lock()
+    session._load_generation = 0
+    session.loading = None
+    session.last_load = None
+    session.requests = []
+    session.requested_by = "tester"
+    session.say = lambda *_args: None
+    session.voice_source = None
+    session._task = None
+    session.started_at = time.time()
+    session.names = []
+
+    class Mixer:
+        def __init__(self):
+            self.loaded = []
+            self._lock = threading.RLock()
+
+        def load(self, nxt):
+            with self._lock:
+                self.loaded.append(nxt.record.title)
+                return "loaded"
+
+        def cleanup(self):
+            pass
+
+    session.source = Mixer()
+    return session
+
+
+def _new_load_thread(previous):
+    import threading
+    current = set(threading.enumerate()) - previous
+    return next(t for t in current if t.name == "kaia-records-load")
+
+
+def test_newest_booth_load_wins_when_older_analysis_finishes_last():
+    import threading
+    from types import SimpleNamespace
+
+    session = _load_race_session()
+    started = {name: threading.Event() for name in ("Old", "New")}
+    release = {name: threading.Event() for name in ("Old", "New")}
+
+    def prepare(rec):
+        started[rec.title].set()
+        assert release[rec.title].wait(timeout=3.0)
+        return R.Next(rec, 60.0)
+
+    session._prepare = prepare
+    old = SimpleNamespace(name="Old record", title="Old", path="/old.mp3")
+    new = SimpleNamespace(name="New record", title="New", path="/new.mp3")
+
+    before = set(threading.enumerate())
+    session.load(old)
+    old_worker = _new_load_thread(before)
+    assert started["Old"].wait(timeout=1.0)
+
+    before = set(threading.enumerate())
+    session.load(new)
+    new_worker = _new_load_thread(before)
+    assert started["New"].wait(timeout=1.0)
+
+    release["New"].set()
+    new_worker.join(timeout=1.0)
+    assert not new_worker.is_alive()
+    assert session.loading is None
+    assert session.source.loaded == ["New"]
+
+    # The old worker finishes only after the latest choice has committed.
+    release["Old"].set()
+    old_worker.join(timeout=1.0)
+    assert not old_worker.is_alive()
+    assert session.source.loaded == ["New"]
+    assert session.last_load["name"] == "New record"
+
+
+def test_after_load_waits_for_the_latest_booth_load_not_an_older_worker():
+    import threading
+    from types import SimpleNamespace
+
+    session = _load_race_session()
+    started = {name: threading.Event() for name in ("Old", "New")}
+    release = {name: threading.Event() for name in ("Old", "New")}
+    callbacks = []
+    callback_done = threading.Event()
+
+    def prepare(rec):
+        started[rec.title].set()
+        assert release[rec.title].wait(timeout=3.0)
+        return R.Next(rec, 60.0)
+
+    session._prepare = prepare
+    old = SimpleNamespace(name="Old record", title="Old", path="/old.mp3")
+    new = SimpleNamespace(name="New record", title="New", path="/new.mp3")
+
+    before = set(threading.enumerate())
+    session.load(old)
+    old_worker = _new_load_thread(before)
+    assert started["Old"].wait(timeout=1.0)
+
+    before = set(threading.enumerate())
+    session.load(new)
+    new_worker = _new_load_thread(before)
+    assert started["New"].wait(timeout=1.0)
+
+    def after():
+        callbacks.append(tuple(session.source.loaded))
+        callback_done.set()
+
+    session.after_load(after)
+    release["Old"].set()
+    old_worker.join(timeout=1.0)
+    assert not old_worker.is_alive()
+    assert session.loading == "New record"
+    assert not callback_done.wait(timeout=0.15)
+
+    release["New"].set()
+    new_worker.join(timeout=1.0)
+    assert not new_worker.is_alive()
+    assert callback_done.wait(timeout=1.0)
+    assert callbacks == [("New",)]
+
+
+def test_records_session_stop_invalidates_outstanding_booth_loads():
+    import asyncio
+    import threading
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    session = _load_race_session()
+    started = threading.Event()
+    release = threading.Event()
+    rec = SimpleNamespace(name="Late record", title="Late", path="/late.mp3")
+
+    def prepare(_rec):
+        started.set()
+        assert release.wait(timeout=3.0)
+        return R.Next(rec, 60.0)
+
+    session._prepare = prepare
+    session.vc = SimpleNamespace(
+        guild=SimpleNamespace(id=99117),
+        is_playing=lambda: False,
+        disconnect=AsyncMock(),
+    )
+    before = set(threading.enumerate())
+    session.load(rec)
+    worker = _new_load_thread(before)
+    assert started.wait(timeout=1.0)
+
+    asyncio.run(session.stop(disconnect=False))
+    assert session.loading is None
+    release.set()
+    worker.join(timeout=1.0)
+    assert not worker.is_alive()
+    assert session.source.loaded == []
+    assert session.last_load is None
+
+
+def test_skip_is_deferred_until_an_in_progress_end_planner_releases_ownership(monkeypatch):
+    import threading
+
+    src, _ = _source()
+    entered = threading.Event()
+    release = threading.Event()
+    original = R._music_end
+    calls = []
+
+    def blocked_end(deck):
+        calls.append(threading.get_ident())
+        if len(calls) == 1:
+            entered.set()
+            assert release.wait(timeout=3.0)
+        return original(deck)
+
+    monkeypatch.setattr(R, "_music_end", blocked_end)
+    src._begin_planning("end")
+    assert entered.wait(timeout=1.0)
+    assert src._planning and src.planning_mode == "end"
+
+    src.skip()
+    assert src._planning
+    assert src.planning_mode == "end"
+    assert src._pending_planning_mode == "skip"
+    assert src.plan is None
+
+    # Repeated NEXTs while one is already queued do not move it or spawn another
+    # deferred planner.
+    src.skip()
+    assert src._pending_planning_mode == "skip"
+
+    release.set()
+    deadline = time.time() + 5.0
+    while (src.plan is None or src.plan.mode != "skip") and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert src.plan is not None and src.plan.mode == "skip"
+    assert src._pending_planning_mode is None
+    assert not src._planning or src.planning_mode == "skip"
+
+
+
+def _blocking_frame_source():
+    import threading
+    from types import SimpleNamespace
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingDeck:
+        def __init__(self):
+            self.record = SimpleNamespace(path="/tmp/records-frame-lock.mp3", name="Current")
+            self.remaining = 20_000
+            self.slot = 1
+            self.played = 0
+            self.ratio = 1.0
+            self.grid = None
+            self.closed = False
+
+        def at(self, frames=None):
+            return 0.0
+
+        def frame(self):
+            entered.set()
+            assert release.wait(timeout=3.0), "test did not release the rendered frame"
+            self.played += 1
+            return bytes(FRAME_BYTES)
+
+        def close(self):
+            self.closed = True
+
+    deck = BlockingDeck()
+    source = CrossfadeSource(deck, pick=lambda _deck: None)
+    source.rides = False
+    return source, deck, entered, release
+
+
+def test_booth_load_waits_for_the_current_audio_frame_boundary():
+    import threading
+    from types import SimpleNamespace
+
+    source, deck, entered, release = _blocking_frame_source()
+    frame_result = []
+    read_thread = threading.Thread(target=lambda: frame_result.append(source.read()), daemon=True)
+    read_thread.start()
+    assert entered.wait(timeout=1.0)
+
+    record = SimpleNamespace(path="/tmp/next.mp3", name="Next")
+    nxt = Next(record, 180.0)
+    mutation_done = threading.Event()
+    mutation_thread = threading.Thread(
+        target=lambda: (source.load(nxt), mutation_done.set()), daemon=True
+    )
+    mutation_thread.start()
+    try:
+        assert not mutation_done.wait(timeout=0.15), "booth load mutated the mixer during a rendered frame"
+    finally:
+        release.set()
+        read_thread.join(timeout=1.0)
+        mutation_thread.join(timeout=1.0)
+
+    assert not read_thread.is_alive() and not mutation_thread.is_alive()
+    assert frame_result == [bytes(FRAME_BYTES)]
+    assert mutation_done.is_set()
+    assert source._queued is nxt
+    source.cleanup()
+    assert deck.closed
+
+
+def test_dashboard_fader_change_waits_for_audio_frame_boundary(monkeypatch):
+    import threading
+    from types import SimpleNamespace
+    from utils.audio import dj_dashboard
+
+    source, _deck, entered, release = _blocking_frame_source()
+    frame_thread = threading.Thread(target=source.read, daemon=True)
+    frame_thread.start()
+    assert entered.wait(timeout=1.0)
+
+    sent = []
+    handler = object.__new__(dj_dashboard._Handler)
+    handler.path = "/control"
+    handler._body = lambda: {"slot": 1, "name": "fader", "value": 0.0}
+    handler._send = lambda *args: sent.append(args)
+    monkeypatch.setattr(dj_dashboard, "_session", lambda: SimpleNamespace(source=source))
+
+    request_done = threading.Event()
+    request_thread = threading.Thread(
+        target=lambda: (handler.do_POST(), request_done.set()),
+        daemon=True,
+    )
+    request_thread.start()
+    try:
+        assert not request_done.wait(timeout=0.15), "dashboard changed a fader during a rendered frame"
+    finally:
+        release.set()
+        frame_thread.join(timeout=1.0)
+        request_thread.join(timeout=1.0)
+
+    assert not frame_thread.is_alive() and not request_thread.is_alive()
+    assert request_done.is_set()
+    assert sent == [(204, b"", "text/plain")]
+    assert source.controls.channels[1]["fader"] == 0.0
+    source.cleanup()
+
+
+def test_renderer_cleanup_waits_for_in_progress_frame():
+    import threading
+
+    source, deck, entered, release = _blocking_frame_source()
+    frame_thread = threading.Thread(target=source.read, daemon=True)
+    frame_thread.start()
+    assert entered.wait(timeout=1.0)
+
+    cleanup_done = threading.Event()
+    cleanup_thread = threading.Thread(
+        target=lambda: (source.cleanup(), cleanup_done.set()), daemon=True
+    )
+    cleanup_thread.start()
+    try:
+        assert not cleanup_done.wait(timeout=0.15), "cleanup retired the current deck mid-frame"
+    finally:
+        release.set()
+        frame_thread.join(timeout=1.0)
+        cleanup_thread.join(timeout=1.0)
+
+    assert not frame_thread.is_alive() and not cleanup_thread.is_alive()
+    assert cleanup_done.is_set()
+    assert deck.closed
+
+
+def test_dashboard_snapshot_waits_for_a_committed_audio_frame(monkeypatch):
+    import threading
+    from types import SimpleNamespace
+    from utils.audio import dj_dashboard
+
+    source, _deck, entered, release = _blocking_frame_source()
+    frame_thread = threading.Thread(target=source.read, daemon=True)
+    frame_thread.start()
+    assert entered.wait(timeout=1.0)
+
+    snapshot_read = threading.Event()
+    snapshot_done = threading.Event()
+    monkeypatch.setattr(
+        dj_dashboard, "_snapshot_locked",
+        lambda _session, _source: (snapshot_read.set() or {"live": True}),
+    )
+    session = SimpleNamespace(source=source)
+    result = []
+    snapshot_thread = threading.Thread(
+        target=lambda: (result.append(dj_dashboard.snapshot(session)), snapshot_done.set()),
+        daemon=True,
+    )
+    snapshot_thread.start()
+    try:
+        assert not snapshot_done.wait(timeout=0.15), "dashboard snapshot read a half-rendered mixer frame"
+        assert not snapshot_read.is_set()
+    finally:
+        release.set()
+        frame_thread.join(timeout=1.0)
+        snapshot_thread.join(timeout=1.0)
+
+    assert not frame_thread.is_alive() and not snapshot_thread.is_alive()
+    assert snapshot_done.is_set() and snapshot_read.is_set()
+    assert result == [{"live": True}]
+    source.cleanup()
+
+
+def test_records_load_worker_obeys_mixer_then_load_lock_order():
+    import threading
+    from types import SimpleNamespace
+
+    session = _load_race_session()
+    prepared = threading.Event()
+    release_prepare = threading.Event()
+    first_mixer_attempt = threading.Event()
+    inversion_seen = threading.Event()
+
+    class OwnedLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self._owner = None
+
+        def __enter__(self):
+            self._lock.acquire()
+            self._owner = threading.get_ident()
+            return self
+
+        def __exit__(self, *_args):
+            self._owner = None
+            self._lock.release()
+
+        def held_by_current_thread(self):
+            return self._owner == threading.get_ident()
+
+    owned_load_lock = OwnedLock()
+    session._load_lock = owned_load_lock
+
+    class ObservedRLock:
+        def __init__(self):
+            self._lock = threading.RLock()
+            self._first_worker_attempt = set()
+
+        def __enter__(self):
+            ident = threading.get_ident()
+            if threading.current_thread().name == "kaia-records-load" and ident not in self._first_worker_attempt:
+                self._first_worker_attempt.add(ident)
+                first_mixer_attempt.set()
+                if owned_load_lock.held_by_current_thread():
+                    inversion_seen.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self._lock.release()
+
+    session.source._lock = ObservedRLock()
+
+    def prepare(record):
+        prepared.set()
+        assert release_prepare.wait(timeout=2.0)
+        return R.Next(record, 60.0)
+
+    session._prepare = prepare
+    record = SimpleNamespace(name="Chosen record", title="Chosen", path="/chosen.mp3")
+
+    # Simulate the dashboard already holding the mixer lock when it requests
+    # another load. The worker must wait for that lock without holding the
+    # session lock, otherwise this route and the worker form a lock cycle.
+    with session.source._lock:
+        before = set(threading.enumerate())
+        session.load(record)
+        worker = _new_load_thread(before)
+        assert prepared.wait(timeout=1.0)
+        release_prepare.set()
+        assert first_mixer_attempt.wait(timeout=1.0)
+        assert not inversion_seen.is_set(), "load worker held _load_lock while waiting for mixer lock"
+
+    worker.join(timeout=1.0)
+    assert not worker.is_alive()
+    assert session.source.loaded == ["Chosen"]
+
+
 def test_measured_alternatives_use_normalized_lock_quality_and_artist_variety(monkeypatch):
     import random
     from types import SimpleNamespace
     from utils.audio import beatgrid
-    from utils.audio.records import RecordsSession
 
     current = rec("current", 124, "8A", "House")
-    current = library.Record(current.path, "First Artist", current.title, current.bpm, current.key, current.genre)
-    good = library.Record("/music/good.mp3", "Second Artist", "good", 124.0, "8A", "House")
-    same_artist = library.Record("/music/repeat.mp3", "First Artist", "repeat", 124.0, "8A", "House")
-    lower_confidence = library.Record("/music/lower.mp3", "Third Artist", "lower", 124.0, "8A", "House")
+    current = library.Record(current.path, "Alpha", current.title, current.bpm, current.key, current.genre)
+    good = library.Record("/music/good.mp3", "Beta", "good", 124.0, "8A", "House")
+    same_artist = library.Record("/music/repeat.mp3", "Alpha", "repeat", 124.0, "8A", "House")
+    lower_confidence = library.Record("/music/lower.mp3", "Gamma", "lower", 124.0, "8A", "House")
 
     graph = {"edges": {current.path: {
         good.path: {"beats": 64, "agree": 14, "bars": 16, "ratio": 1.0},
         same_artist.path: {"beats": 64, "agree": 14, "bars": 16, "ratio": 1.0},
-        # More raw agreeing bars, but a lower share of its much longer overlap.
+        # More raw agreeing bars, but a lower share of its longer overlap.
         lower_confidence.path: {"beats": 128, "agree": 20, "bars": 32, "ratio": 1.0},
     }}}
-    session = RecordsSession.__new__(RecordsSession)
+    session = R.RecordsSession.__new__(R.RecordsSession)
     session.played = []
     session._by_path = {r.path: r for r in (current, good, same_artist, lower_confidence)}
     session.graph = graph
