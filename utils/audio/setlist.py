@@ -17,12 +17,15 @@ the live planner still measures every blend before it starts.
 """
 from __future__ import annotations
 
+import asyncio
+import fcntl
 import json
 import math
 import os
 import random
 import threading
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -33,7 +36,7 @@ VERSION = 2
 #: again whole: the judge has only ever become stricter, so an old edge is not
 #: evidence.
 METHOD = 4
-# Set ranking changes do not invalidate the expensive audio-pair measurements.
+# Playlist taste changes rebuild paths, not the expensive measured audio graph.
 SET_METHOD = 2
 MAX_SETS = 16
 #: A set runs about an hour: it is walked until it reaches SET_TARGET_S of
@@ -245,8 +248,11 @@ def _changed(entry: Optional[dict], path: str) -> bool:
 
 
 def needs_build(g: dict, crate: list) -> bool:
-    """Something to measure: a record new or changed since the graph saw it,
-    or pairs left from an older way of measuring."""
+    """Whether measurements or their derived set paths need rebuilding.
+
+    METHOD versions the audio evidence; SET_METHOD versions the ranking built
+    from that evidence. A SET_METHOD change never invalidates measured pairs.
+    """
     if g.get("method", 2) < METHOD or g.get("sets_method", 1) < SET_METHOD:
         return True
     recs = g.get("records", {})
@@ -446,20 +452,18 @@ def blend_rank(edge: Optional[dict]) -> int:
 def transition_rank(current, candidate, edge: Optional[dict], *, history=(),
                      start_family: Optional[str] = None, onward: int = 0,
                      rng: Optional[random.Random] = None) -> tuple:
-    """Shared taste rank for sets, measured partners and search alternatives.
+    """Shared taste rank for set construction, live partners and alternatives.
 
-    Rhythm remains the gate: longer blends rank first, then the fraction of
-    judged bars that agree. Among comparable locks, prefer a compatible key,
-    the exact genre (then its family), artists not already used in this run,
-    and less pitch/tempo correction. This ranks choices; it never makes an
-    unlocked pair eligible.
+    Rhythm remains the gate. Blend duration is balanced with harmonic fit;
+    ties prefer exact style, measured agreement confidence, artist variety,
+    gentle tempo correction and useful onward partners.
     """
     from utils.audio import library
 
     edge = edge or {}
     bars = float(edge.get("bars") or 0.0)
     agree = float(edge.get("agree") or 0.0)
-    confidence = max(0.0, min(1.0, agree / bars)) if bars > 0 else 1.0
+    confidence = max(0.0, min(1.0, agree / bars)) if bars > 0 else 0.0
 
     step = library.key_step(current.key, candidate.key)
     key_penalty = {0: 0, 1: 0, 2: 1}.get(step, 2)
@@ -471,7 +475,7 @@ def transition_rank(current, candidate, edge: Optional[dict], *, history=(),
     elif family(current) == family(candidate):
         style_penalty = 1
     else:
-        style_penalty = 3
+        style_penalty = 0
 
     target_family = start_family or family(current)
     family_penalty = 0 if family(candidate) == target_family else 2
@@ -485,11 +489,11 @@ def transition_rank(current, candidate, edge: Optional[dict], *, history=(),
     stretch_penalty = round(abs(math.log(ratio)), 4) if ratio and ratio > 0 else 1.0
 
     return (
-        blend_rank(edge),
-        -round(confidence, 4),
+        blend_rank(edge) + key_penalty + style_penalty + family_penalty,
         key_penalty,
         style_penalty,
         family_penalty,
+        -round(confidence, 4),
         artist_repeats,
         stretch_penalty,
         -min(max(0, int(onward)), 6),
@@ -540,9 +544,11 @@ def make_sets(g: dict, live: dict, rng: Optional[random.Random] = None) -> list:
                     history=[live[p] for p in path], start_family=fam[start],
                     onward=ahead,
                 )
-                # Use count remains a cross-set diversity tiebreak after musical fit.
                 return rank[:-1] + (used.get(b, 0), rng.random())
-            return sorted(out, key=score)[:5]
+            # Keep the whole ranked frontier. The bounded DFS below widens
+            # from the best five to further candidates when preferred paths
+            # dead-end; truncating here made backtracking unable to see them.
+            return sorted(out, key=score)
 
         def dfs():
             nonlocal best, best_len
@@ -551,12 +557,24 @@ def make_sets(g: dict, live: dict, rng: Optional[random.Random] = None) -> list:
                 best, best_len = list(path), n
             if n >= target or budget[0] <= 0:
                 return n >= target
-            for b in options(path[-1]):
-                budget[0] -= 1
-                path.append(b)
-                if dfs():
-                    return True
-                path.pop()
+            ranked = options(path[-1])
+            # Progressive widening: exhaust the best five first, then admit
+            # the next ten, then twenty, etc. WALK_BUDGET remains the hard
+            # per-start limit, so a large graph cannot cause unbounded DFS.
+            width = min(5, len(ranked))
+            offset = 0
+            while offset < len(ranked) and budget[0] > 0:
+                end = min(len(ranked), width)
+                for b in ranked[offset:end]:
+                    if budget[0] <= 0:
+                        return False
+                    budget[0] -= 1
+                    path.append(b)
+                    if dfs():
+                        return True
+                    path.pop()
+                offset = end
+                width = min(len(ranked), max(width + 1, width * 2))
             return False
         dfs()
         return best, best_len
@@ -627,6 +645,61 @@ def _rotation_path() -> Path:
     return Path(telemetry_path("memory/records/set_rotation.json"))
 
 
+@asynccontextmanager
+async def rotation_transaction():
+    """Hold the global set-selection/commit transaction across voice startup.
+
+    The rotation file is shared by every guild (and may be shared by more
+    than one bot process using the same telemetry directory). Atomic JSON
+    replacement prevents partial files, but it does not serialize the
+    read -> choose -> start -> advance sequence. A sidecar flock does.
+
+    Lock acquisition and release run in worker threads so waiting for another
+    guild/process never blocks Discord's event loop. If the caller is cancelled
+    while acquisition is pending, wait for that acquisition to finish and
+    release it before propagating cancellation.
+    """
+    path = _rotation_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+    open_task = asyncio.create_task(asyncio.to_thread(
+        lock_path.open, "a", encoding="utf-8"
+    ))
+    try:
+        lock_file = await asyncio.shield(open_task)
+    except asyncio.CancelledError:
+        # Do not orphan a file descriptor if cancellation races the worker's
+        # open() call.
+        lock_file = await asyncio.shield(open_task)
+        await asyncio.to_thread(lock_file.close)
+        raise
+    acquire_task = asyncio.create_task(asyncio.to_thread(
+        fcntl.flock, lock_file.fileno(), fcntl.LOCK_EX
+    ))
+    try:
+        await asyncio.shield(acquire_task)
+    except asyncio.CancelledError:
+        try:
+            await asyncio.shield(acquire_task)
+        finally:
+            await asyncio.to_thread(
+                fcntl.flock, lock_file.fileno(), fcntl.LOCK_UN
+            )
+            await asyncio.to_thread(lock_file.close)
+        raise
+    except BaseException:
+        await asyncio.to_thread(lock_file.close)
+        raise
+
+    try:
+        yield
+    finally:
+        await asyncio.to_thread(
+            fcntl.flock, lock_file.fileno(), fcntl.LOCK_UN
+        )
+        await asyncio.to_thread(lock_file.close)
+
+
 def peek_rotation(n_sets: int) -> Optional[int]:
     """The index the next `!music records` will start, without advancing it."""
     if not n_sets:
@@ -637,31 +710,52 @@ def peek_rotation(n_sets: int) -> Optional[int]:
         return 0
 
 
-def next_set(g: dict, crate: list) -> Optional[list]:
-    """The next set in rotation (paths still in the crate), advancing the
-    rotation kept beside the graph so each session starts the next one."""
+def peek_next_set(g: dict, crate: list) -> Optional[list]:
+    """Return the next live set without consuming its rotation slot.
+
+    The caller commits the rotation only after the corresponding records
+    session has successfully started. A failed voice join must not skip a set.
+    """
     sets = live_sets(g, crate)
     if not sets:
         return None
+    k = peek_rotation(len(sets))
+    return sets[k or 0]
+
+
+def advance_rotation(g: dict, crate: list) -> bool:
+    """Commit one rotation step after a records session successfully starts."""
+    count = len(live_sets(g, crate))
+    if not count:
+        return False
     from utils.core.atomic_write import write_atomic
     path = _rotation_path()
+    k = peek_rotation(count) or 0
     try:
-        k = int(json.loads(path.read_text(encoding="utf-8")).get("next", 0))
-    except (OSError, ValueError):
-        k = 0
-    try:
-        write_atomic(path, json.dumps({"next": k + 1}))
-    except OSError:
-        pass
-    return sets[k % len(sets)]
+        write_atomic(path, json.dumps({"next": (k + 1) % count}))
+        return True
+    except OSError as exc:
+        log_warning(f"[sets] could not advance set rotation: {exc}")
+        return False
+
+
+def next_set(g: dict, crate: list) -> Optional[list]:
+    """Compatibility helper: choose and immediately consume the next set."""
+    chosen = peek_next_set(g, crate)
+    if chosen is not None:
+        advance_rotation(g, crate)
+    return chosen
 
 
 def build_in_background(crate: list, budget_s: Optional[float] = None,
-                        on_done: Optional[Callable[[dict], None]] = None) -> bool:
-    """Measure what is new in `crate` in a separate, niced process
-    (`tools/maintenance/records_graph.py`): the measuring is numpy-heavy, and in
-    the bot's own process it holds the GIL against the voice thread. `on_done`
-    gets the graph when it finishes. True if started."""
+                        on_done: Optional[Callable[[dict], None]] = None,
+                        sets_only: bool = False) -> bool:
+    """Rebuild graph measurements, or only derived set paths, in a niced process.
+
+    Full measurement is numpy-heavy and would hold the bot's GIL against the
+    voice thread. `sets_only` is safe only when the audio graph is current and
+    all compatible pairs have already been checked. `on_done` receives the graph.
+    """
     import subprocess
     import sys
     import tempfile
@@ -675,6 +769,8 @@ def build_in_background(crate: list, budget_s: Optional[float] = None,
         json.dump([asdict(r) for r in crate], fh)
     cmd = [sys.executable, str(root / "tools" / "maintenance" / "records_graph.py"), "--apply", "--quiet", "--jobs", "3",
            "--crate", rows]
+    if sets_only:
+        cmd.append("--sets-only")
     if budget_s:
         cmd += ["--budget-min", f"{budget_s / 60:.2f}"]
     env = dict(os.environ)
