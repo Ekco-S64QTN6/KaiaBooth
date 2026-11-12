@@ -23,7 +23,7 @@
  "tools/tests/unit/__init__.py": "9a4a1d0d63dbdc242b4536d00334837ec3c459a6ee5f81ca31688ef48312559c",
  "tools/tests/unit/test_dj_dashboard.py": "665be4b837972fc47c13aef54cebcc3756344adf4ff178c95354ad8e1b3038c2",
  "tools/tests/unit/test_dj_voice.py": "518cb490bc3d26022f1edba04eff05adbc6932600056da115cca4e0ce41e3b75",
- "tools/tests/unit/test_mixcheck.py": "427d6e264de2172fc24b159b3ede81fd03a8abc7710ebac0397823c785b024fe",
+ "tools/tests/unit/test_mixcheck.py": "5e17a56aaf16ba4fc8c061465b3bfeeba167201701f3aede991132d852783896",
  "tools/tests/unit/test_process_lifecycle.py": "51fb824f94bf0ce107ad35377fe4441e902f24c3b0bf72e5d89ff2a3da3564f0",
  "tools/tests/unit/test_records.py": "c5e3c199b2257c0e989c7ebbdb99b01d31e66ad378882c3397218aa7d7aa6a1d",
  "tools/tests/unit/test_setlist.py": "ef41e2f8c3ddf3b0f543a8ce5ea1332d2555cc609bf8a1bedb25797df46a3889",
@@ -41,14 +41,14 @@
  "utils/audio/voice_busy.py": "56e768e4c2bb1af712af3c000da0565b5d1afac060f56e64977f30e6d65e0ea1",
  "utils/core/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
  "utils/core/atomic_write.py": "ae0d143bdb136f206863407ec562214a9793ef29f59ddb8fae09ac1bec6d44ae",
- "utils/core/sanitizer.py": "2cb9506229404ff5b9d1518b543437fa34329d29f92a38fd741f39c0fc7a0e56",
+ "utils/core/sanitizer.py": "e6b05f4650fdd09b6d6466dc0c8774bec409164d7f49e1a157ffd901377c7b69",
  "utils/infrastructure/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
  "utils/infrastructure/logging/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
  "utils/infrastructure/logging/kaia_logger.py": "7d36e45fbeb3cf1c0b13cf525eff473bb1b57e2a5f4b4c7577d22dcb6e5c6b23",
  "utils/infrastructure/logging/log_sanitize.py": "eef25e36dc50a0021793a80edbeb68ea46121b9b8accf66c8a2ffff5017caabc",
  "utils/infrastructure/logging/unified_logging.py": "4ef81559b3ca78877b0983a8c0cac227b9ad0a62bec2628c863cf47dbbc361b1",
  "utils/infrastructure/monitoring/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
- "utils/infrastructure/monitoring/async_task_registry.py": "d7f18a408e01bbd2184e5f1352440f611225f997fa831028dbf5c56074ea26f6",
+ "utils/infrastructure/monitoring/async_task_registry.py": "281b0a35ac70a081d1dbd0f97bb5309edde930015f175d14cc58a0d167b74584",
  "utils/infrastructure/monitoring/telemetry_paths.py": "f8042f4b80c2f8bec1babbeb3056525d72cfbe4eefe916b20d893ccb84106452",
  "utils/infrastructure/system/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
  "utils/infrastructure/system/app_window.py": "180d85d07ea3feea14f4abd61cc6dbee912680eeee904e739225918147e43189",
@@ -56,5 +56,5 @@
  "utils/infrastructure/system/kaia_avatar.py": "bb015a71d39bdf453b0fdde414004743ba7bd1e7f15c7215f87c169f00a91e1e",
  "utils/radio/__init__.py": "3f6eca5e05282d0263135e1f13119377b5d5953ab31d5f10ff8ac0807119ba32",
  "utils/radio/fetch.py": "b492252da9dcd42afad57020a1ded98ce4ac2ddcd412b066ad98bf0805500988",
- "utils/radio/kiwi.py": "72622e5985de05adf0ca4ae0a9c2c46ffd41a4d79dde875aafa87b3cf0fd0ffa"
+ "utils/radio/kiwi.py": "ccecfa07f7ad191240ee598582c043eceb0e1ced3daa3e30d17c869606b007bb"
 }
