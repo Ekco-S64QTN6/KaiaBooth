@@ -34,7 +34,7 @@
  "utils/audio/dj_dashboard.py": "4af0c57515accf94f820fbb8927f1ebe02488045d885874b0b177bb796cb4f7b",
  "utils/audio/dj_voice.py": "dbefcdf4291ba19cd205f61ce330f4f851b860912a67292ff2acc81ce4f1b2c3",
  "utils/audio/library.py": "8267724713bf24a6a436a105669cc712b5fc828a8bed9bd2ce4b60ec2744a887",
- "utils/audio/mixcheck.py": "81e52697ccc19f705e5cba01e021dd76f1103f9e040ec9479639303c135f0782",
+ "utils/audio/mixcheck.py": "a7fc751a62f9c5c7fd6304821d64f37f42e8dda39a04af4728dcdf1135144806",
  "utils/audio/process_lifecycle.py": "0b3b3cdd2c696d97ff2f9c7d082c44b11acc139fd2475a9da6138e6a0fb26631",
  "utils/audio/records.py": "373d117e5dd312cf5775c5a1f1cfbab8ed70ffa1c20647a65b199e429d4ad8d8",
  "utils/audio/setlist.py": "81d2662564afe072ed90e5a6454e7ea3c6f119a5e6af734e9f0b8246ad50a9e6",
