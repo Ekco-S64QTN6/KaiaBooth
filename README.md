@@ -9,8 +9,12 @@ a set, live:
   graph of which records actually *lock* with which, walked as hour-long sets.
 - **The blends are real beatmatched mixes:** a counted bar, not a guessed one; the
   incoming record stretched with rubberband (and shifted a semitone when the keys
-  clash); a two-bar bass handover; 32, 64 or 256-beat blends; an echo-out on the bar
-  where nothing locks. Everything is levelled to a common loudness.
+  clash); a two-bar bass handover; 16–256-beat blends; an echo-out on the bar
+  where nothing locks. Everything is levelled to a common loudness. The vocal-presence
+  band changes hands with the mids, leaving only the upper-air band to lead or trail,
+  so two records' vocals do not overlap. The mix looks for the outgoing record's outro
+  or final breakdown as its exit point (falling back near the end when neither is
+  suitable), and the booth meters/playheads follow the frame actually being heard.
 - **She rides the mixer** through the set — gain staging, trading mids, a bass kill in
   long blends — harder with her energy. Her mood (you set it) steers the opener.
 - **The booth window** shows both decks and the mixer as she plays; NEXT, HANDS and the
