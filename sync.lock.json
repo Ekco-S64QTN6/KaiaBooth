@@ -42,7 +42,7 @@
  "utils/audio/songmap.py": "ae19174b3ee2e0e5c3fc89a7cb424dfd9137636e1a3037ab6e6437d0c39bdb1b",
  "utils/audio/voice_busy.py": "56e768e4c2bb1af712af3c000da0565b5d1afac060f56e64977f30e6d65e0ea1",
  "utils/core/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
- "utils/core/atomic_write.py": "7b43ba51b69844b97f1c616e188f09be31ffd81dd457ad4d0e2ad31d56e2dd96",
+ "utils/core/atomic_write.py": "b0baa5e6fcf7b79e44cb0cf153afd55574a0bab6d2a50e44f4cae63bc824b168",
  "utils/core/sanitizer.py": "95d0b3b8aae93c28736e2b76385fc5075064626959fd1753319e21af7b9f2d26",
  "utils/infrastructure/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
  "utils/infrastructure/logging/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
