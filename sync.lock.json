@@ -38,7 +38,7 @@
  "utils/audio/mixcheck.py": "4a0c98af49c2dbede57cdabe5d8464d4aa3ab3e17a8edc1756961d4e194ef02e",
  "utils/audio/process_lifecycle.py": "0b3b3cdd2c696d97ff2f9c7d082c44b11acc139fd2475a9da6138e6a0fb26631",
  "utils/audio/records.py": "042b428809c483a3bd1504a5f0cc2cea9abc66b3859fbcd9351b5eb6e6180191",
- "utils/audio/setlist.py": "16210e81039af388d59f749051a0178c93c045fabf03f605afff1243b5fc4e2d",
+ "utils/audio/setlist.py": "5a887fc756af668639f7eff80b010b46f005b4c728af36e74b020bbe35c8458f",
  "utils/audio/songmap.py": "ae19174b3ee2e0e5c3fc89a7cb424dfd9137636e1a3037ab6e6437d0c39bdb1b",
  "utils/audio/voice_busy.py": "56e768e4c2bb1af712af3c000da0565b5d1afac060f56e64977f30e6d65e0ea1",
  "utils/core/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
