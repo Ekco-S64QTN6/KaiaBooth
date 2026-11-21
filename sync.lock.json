@@ -19,7 +19,7 @@
  "tools/maintenance/beat_ticks.py": "c1b995eef1ee8695fe110df3599f3729e10bb64aa0158fe389e03c6336738575",
  "tools/maintenance/records_graph.py": "b3c41467c6766d08e939f98148d88b1b6229cb6d48f849ba575adc93a33033e3",
  "tools/tests/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
- "tools/tests/conftest.py": "44c1652eaad5de5bbece3050b8d6bdc4570a0deea7e4c19b3be814c509402521",
+ "tools/tests/conftest.py": "c5a04a5f5153b9cf430e6c5c965db866168e817532060e266fb7c9ea3e22ffa0",
  "tools/tests/unit/__init__.py": "9a4a1d0d63dbdc242b4536d00334837ec3c459a6ee5f81ca31688ef48312559c",
  "tools/tests/unit/test_dj_dashboard.py": "7a9a97556e93d49d22acd2c391a59661899c5a2cd65db22055f9f38d9604e281",
  "tools/tests/unit/test_dj_voice.py": "518cb490bc3d26022f1edba04eff05adbc6932600056da115cca4e0ce41e3b75",
