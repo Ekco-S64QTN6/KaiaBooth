@@ -286,28 +286,98 @@ def _ticks_path(path: str) -> Path:
     return TICKS_DIR / (hashlib.sha1(path.encode("utf-8")).hexdigest()[:16] + ".json")
 
 
-@functools.lru_cache(maxsize=512)
-def _read_ticks(cache: str, mtime: float) -> Optional[np.ndarray]:
+def _audio_identity(path: str, *, refresh: bool = False) -> Optional[str]:
+    from utils.audio.library import audio_signature
+    return audio_signature(path, refresh=refresh)
+
+
+def _valid_tick_array(value) -> Optional[np.ndarray]:
+    """A cached phase must be a finite, strictly increasing one-dimensional beat list."""
     try:
-        t = np.asarray(json.loads(Path(cache).read_text(encoding="utf-8"))["ticks"], dtype=float)
-    except (OSError, ValueError, KeyError):
+        ticks = np.asarray(value, dtype=float)
+    except (TypeError, ValueError, OverflowError):
         return None
-    return t if len(t) >= 16 else None
+    if (ticks.ndim != 1 or len(ticks) < 16 or not np.all(np.isfinite(ticks))
+            or np.any(np.diff(ticks) <= 0)):
+        return None
+    return ticks
 
 
-def ticks_for(path: str) -> Optional[np.ndarray]:
-    """The record's beat ticks (seconds, own time), if they have been found."""
-    p = _ticks_path(path)
+@functools.lru_cache(maxsize=512)
+def _read_ticks(cache: str, identity: str, cache_mtime_ns: int,
+                target_bpm: Optional[float] = None) -> Optional[tuple[np.ndarray, Optional[np.ndarray]]]:
+    """Read complete tick candidates only for the audio identity and requested fold target."""
     try:
-        return _read_ticks(str(p), p.stat().st_mtime)
+        data = json.loads(Path(cache).read_text(encoding="utf-8"))
+        if data.get("audio_signature") != identity or "alternate_ticks" not in data:
+            return None
+        if target_bpm is not None:
+            stored_target = data.get("target_bpm")
+            if stored_target is None or round(float(stored_target), 3) != target_bpm:
+                return None
+        ticks = _valid_tick_array(data["ticks"])
+        if ticks is None:
+            return None
+        alternate_raw = data["alternate_ticks"]
+        alternate = None if alternate_raw is None else _valid_tick_array(alternate_raw)
+        if alternate_raw is not None and alternate is None:
+            return None
+    except (OSError, ValueError, KeyError, TypeError, OverflowError):
+        return None
+    return ticks, alternate
+
+
+def _tick_candidates(path: str, bpm: Optional[float] = None):
+    """Read cached tick candidates for one unchanged audio identity and target BPM."""
+    identity = _audio_identity(path)
+    if identity is None:
+        return None
+    target_bpm = round(float(bpm), 3) if bpm else None
+    cache = _ticks_path(path)
+    try:
+        cache_mtime_ns = cache.stat().st_mtime_ns
     except OSError:
         return None
+    cached = _read_ticks(str(cache), identity, cache_mtime_ns, target_bpm)
+    if cached is None or _audio_identity(path) != identity:
+        return None
+    return identity, cached
+
+
+def ticks_available(path: str, bpm: Optional[float] = None) -> bool:
+    """Whether target-matched tick data exists, without choosing a beat phase."""
+    return _tick_candidates(path, bpm) is not None
+
+
+def ticks_for(path: str, bpm: Optional[float] = None, *,
+              near: Optional[float] = None) -> Optional[np.ndarray]:
+    """Ticks for this audio/target, selected against a local onset-grid phase.
+
+    A double-tempo cache has two plausible phases. It is never returned without
+    a local grid hint, and ties fall back to the conservative onset-derived grid.
+    """
+    candidates = _tick_candidates(path, bpm)
+    if candidates is None:
+        return None
+    identity, (ticks, alternate) = candidates
+    if alternate is not None:
+        if near is None:
+            return None
+        primary_distance = float(np.min(np.abs(ticks - near)))
+        alternate_distance = float(np.min(np.abs(alternate - near)))
+        expected_beat = 60.0 / round(float(bpm), 3) if bpm else float(np.median(np.diff(ticks)))
+        ambiguity_margin = max(0.002, 0.05 * expected_beat)
+        if abs(primary_distance - alternate_distance) <= ambiguity_margin:
+            return None
+        if alternate_distance < primary_distance:
+            ticks = alternate
+    return ticks if _audio_identity(path) == identity else None
 
 
 def ensure_ticks(path: str, bpm: Optional[float]) -> bool:
-    """Find the record's ticks if they aren't cached (~2–3 s, the system
-    Python with Essentia). Blocking: call it off the voice thread."""
-    if ticks_for(path) is not None:
+    """Find ticks for this audio and catalog BPM if that cache is absent (~2–3 s).
+    Uses system Python with Essentia. Blocking: call it off the voice thread."""
+    if ticks_available(path, bpm):
         return True
     try:
         from utils.infrastructure.monitoring.telemetry_paths import is_test_run
@@ -318,15 +388,16 @@ def ensure_ticks(path: str, bpm: Optional[float]) -> bool:
                        capture_output=True, timeout=180)
     except (OSError, subprocess.SubprocessError):
         return False
-    return ticks_for(path) is not None
+    return ticks_available(path, bpm)
 
 
-def _snap(g: Optional[Grid], path: str, anchor: Optional[Grid] = None) -> Optional[Grid]:
-    """`g` with its tempo and phase from the record's ticks, where it has them:
-    the downbeat moved onto the nearest tick, the beat fitted through all of
-    them. Left alone where the tracker disagrees grossly on the tempo."""
-    t = ticks_for(path)
-    if g is None or t is None:
+def _snap(g: Optional[Grid], path: str, anchor: Optional[Grid] = None,
+          target_bpm: Optional[float] = None) -> Optional[Grid]:
+    """Snap a local grid to ticks folded for the original catalog BPM."""
+    if g is None:
+        return None
+    t = ticks_for(path, target_bpm, near=g.downbeat)
+    if t is None:
         return g
     k = int(np.argmin(np.abs(t - g.downbeat)))
     beat = Grid(g.bpm, g.downbeat, g.contrast, ticks=t).local_beat()
@@ -345,16 +416,24 @@ def _snap(g: Optional[Grid], path: str, anchor: Optional[Grid] = None) -> Option
 
 def grid_at(path: str, bpm: Optional[float], start: float = 0.0, seconds: float = 40.0,
             anchor: Optional[Grid] = None) -> Optional[Grid]:
-    """`_grid_at`, its tempo and phase from the record's ticks where it has them."""
-    return _snap(_grid_at(path, bpm, start, seconds, anchor), path, anchor)
+    """Read a local beat grid only while the source audio remains unchanged."""
+    identity = _audio_identity(path)
+    if identity is None:
+        return None
+    grid = _grid_at(path, bpm, start, seconds, anchor)
+    result = _snap(grid, path, anchor, bpm)
+    return result if _audio_identity(path, refresh=True) == identity else None
 
 
 def grid_for(path: str, bpm: Optional[float], seconds: float = 60.0) -> Optional[Grid]:
-    """`_grid_for`, its tempo and phase from the record's ticks where it has them."""
-    return _snap(_grid_for(path, bpm, seconds), path)
+    """The opening grid, tick-snapped and keyed to the current audio identity."""
+    identity = _audio_identity(path)
+    if identity is None:
+        return None
+    grid = _grid_for(path, bpm, seconds)
+    result = _snap(grid, path, target_bpm=bpm)
+    return result if _audio_identity(path) == identity else None
 
-
-grid_for.cache_clear = lambda: _grid_for.cache_clear()       # the onset grid underneath is cached
 
 
 def _grid_at(path: str, bpm: Optional[float], start: float = 0.0, seconds: float = 40.0,
@@ -388,10 +467,8 @@ def _grid_at(path: str, bpm: Optional[float], start: float = 0.0, seconds: float
 
 
 @functools.lru_cache(maxsize=128)
-def _grid_for(path: str, bpm: Optional[float], seconds: float = 60.0) -> Optional[Grid]:
-    """The grid of a record's opening, where it is mixed in: `downbeat` is the
-    first beat of the record's beat — bar one — not the comb's first tooth,
-    which can fall in the silence or the beatless intro before it."""
+def _grid_for_cached(path: str, bpm: Optional[float], seconds: float, identity: str) -> Optional[Grid]:
+    """The opening grid, keyed by the record's complete audio identity."""
     if not bpm:
         return None
     try:
@@ -403,7 +480,8 @@ def _grid_for(path: str, bpm: Optional[float], seconds: float = 60.0) -> Optiona
         return None
     first = first_strong_beat(onsets, g)
     if first is None:
-        return Grid(g.bpm, g.downbeat, g.contrast, bar_known=False)
+        result = Grid(g.bpm, g.downbeat, g.contrast, bar_known=False)
+        return result if _audio_identity(path, refresh=True) == identity else None
     contrast = g.contrast
     if first > 3.0:
         # A blend starts the record at its first beat, so its steadiness is
@@ -415,11 +493,23 @@ def _grid_for(path: str, bpm: Optional[float], seconds: float = 60.0) -> Optiona
                 contrast = max(contrast, g2.contrast)
         except (OSError, subprocess.SubprocessError, ValueError):
             pass
-    return Grid(g.bpm, first, contrast, bar_known=True)
+    result = Grid(g.bpm, first, contrast, bar_known=True)
+    return result if _audio_identity(path, refresh=True) == identity else None
+
+
+def _grid_for(path: str, bpm: Optional[float], seconds: float = 60.0) -> Optional[Grid]:
+    identity = _audio_identity(path)
+    return _grid_for_cached(path, bpm, seconds, identity) if identity else None
+
+
+setattr(_grid_for, "cache_clear", _grid_for_cached.cache_clear)
+setattr(_grid_for, "cache_info", _grid_for_cached.cache_info)
+setattr(grid_for, "cache_clear", _grid_for_cached.cache_clear)
+setattr(grid_for, "cache_info", _grid_for_cached.cache_info)
 
 
 @functools.lru_cache(maxsize=256)
-def first_sound(path: str, threshold_db: float = -45.0) -> float:
+def _first_sound_cached(path: str, threshold_db: float, identity: str) -> float:
     """Seconds to the first moment the record is audible (Mixxx uses the
     first point over -60 dBFS; -45 skips encoder noise and room tone). A
     record started from its first sample brought its silence in with it."""
@@ -434,11 +524,21 @@ def first_sound(path: str, threshold_db: float = -45.0) -> float:
         return 0.0
     rms = np.sqrt(np.mean(a[: n * 400].astype(np.float32).reshape(n, 400) ** 2, axis=1))
     loud = np.flatnonzero(rms > 32768 * 10 ** (threshold_db / 20))
-    return float(max(0.0, loud[0] * 0.05 - 0.05)) if len(loud) else 0.0
+    result = float(max(0.0, loud[0] * 0.05 - 0.05)) if len(loud) else 0.0
+    return result if _audio_identity(path, refresh=True) == identity else 0.0
+
+
+def first_sound(path: str, threshold_db: float = -45.0) -> float:
+    identity = _audio_identity(path)
+    return _first_sound_cached(path, threshold_db, identity) if identity else 0.0
+
+
+setattr(first_sound, "cache_clear", _first_sound_cached.cache_clear)
+setattr(first_sound, "cache_info", _first_sound_cached.cache_info)
 
 
 @functools.lru_cache(maxsize=256)
-def bass_entry(path: str, bpm: Optional[float], bars: int = 64) -> Optional[int]:
+def _bass_entry_cached(path: str, bpm: Optional[float], bars: int, identity: str) -> Optional[int]:
     """The bar (counted from bar one, 0-based) where the record's bassline
     comes in: the first bar whose sub-bass (under 100 Hz) reaches 60% of its
     usual level over the opening and holds for three of the next four. A dance
@@ -470,12 +570,23 @@ def bass_entry(path: str, bpm: Optional[float], bars: int = 64) -> Optional[int]
     for k in range(count - 4):
         if on[k] and on[k + 1:k + 5].sum() >= 3:
             near = int(round(k / 4)) * 4
-            return near if abs(near - k) <= 1 else k
+            result = near if abs(near - k) <= 1 else k
+            return result if _audio_identity(path, refresh=True) == identity else None
     return None
 
 
+def bass_entry(path: str, bpm: Optional[float], bars: int = 64) -> Optional[int]:
+    identity = _audio_identity(path)
+    return _bass_entry_cached(path, bpm, bars, identity) if identity else None
+
+
+setattr(bass_entry, "cache_clear", _bass_entry_cached.cache_clear)
+setattr(bass_entry, "cache_info", _bass_entry_cached.cache_info)
+
+
 @functools.lru_cache(maxsize=128)
-def last_strong_beat(path: str, bpm: Optional[float], duration: float, tail: float = 120.0) -> Optional[float]:
+def _last_strong_beat_cached(path: str, bpm: Optional[float], duration: float, tail: float,
+                             identity: str) -> Optional[float]:
     """Seconds (own time) of the record's last strong beat: where its music
     ends, before a beatless outro, a fade or trailing silence. DJ software
     mixes out at the outro, not at the end of the file; blending over a fade
@@ -498,8 +609,18 @@ def last_strong_beat(path: str, bpm: Optional[float], duration: float, tail: flo
     strong = h > 0.35 * np.percentile(h, 75)
     for k in range(len(teeth) - 1, 2, -1):
         if strong[k] and strong[k - 3:k].sum() >= 2:
-            return float(start + teeth[k] / HOPS_PER_S)
+            result = float(start + teeth[k] / HOPS_PER_S)
+            return result if _audio_identity(path, refresh=True) == identity else None
     return None
+
+
+def last_strong_beat(path: str, bpm: Optional[float], duration: float, tail: float = 120.0) -> Optional[float]:
+    identity = _audio_identity(path)
+    return _last_strong_beat_cached(path, bpm, duration, tail, identity) if identity else None
+
+
+setattr(last_strong_beat, "cache_clear", _last_strong_beat_cached.cache_clear)
+setattr(last_strong_beat, "cache_info", _last_strong_beat_cached.cache_info)
 
 
 def _decode_stretched(path: str, start: float, seconds: float, ratio: float) -> np.ndarray:

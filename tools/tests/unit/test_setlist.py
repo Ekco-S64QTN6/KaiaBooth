@@ -5,8 +5,11 @@ preferred the long ones: on 31 Oct a third of the hour sets' transitions were
 16-beat blends, which Ekco heard as "mixes into the next song super quick".
 """
 import random
+from types import SimpleNamespace
 
-from utils.audio import setlist
+import pytest
+
+from utils.audio import mixcheck, setlist
 from utils.audio.library import Record
 
 N = 14
@@ -198,3 +201,115 @@ def test_legacy_next_set_still_selects_and_advances(tmp_path, monkeypatch):
     ]}
     assert setlist.next_set(graph, crate) == [r.path for r in crate[:4]]
     assert setlist.peek_next_set(graph, crate) == [r.path for r in crate[4:]]
+
+
+def test_set_builder_prefers_a_coherent_handoff_over_a_cluttered_measured_pair():
+    from utils.audio.songmap import PhraseProfile, PhraseState
+
+    def rec(name, genre="House"):
+        return Record(f"/m/{name}.mp3", f"Artist {name}", name, 120.0, "8A", genre)
+
+    def profile(section, *, level=-12.0):
+        state = PhraseState(
+            start=0.0, end=64.0, aligned=True, bars=4,
+            full_db=level, bass_db=level, lead_db=level,
+            upper_db=level, transient_db=level, energy_change_db=0.0,
+            section=section, section_strength=0.8,
+        )
+        return PhraseProfile(64.0, 4, 120.0, 8.0, True, (state,))
+
+    start, crowded, coherent = rec("Start"), rec("Crowded"), rec("Surprise", "Techno")
+    c1, c2, s1, s2 = rec("C1"), rec("C2"), rec("S1"), rec("S2")
+    live = {r.path: r for r in (start, crowded, coherent, c1, c2, s1, s2)}
+    edge = {"beats": 64, "back": 0, "cue": 0, "agree": 16, "bars": 16, "ratio": 1.0}
+    graph = {
+        "records": {},
+        "edges": {
+            start.path: {crowded.path: dict(edge), coherent.path: dict(edge)},
+            crowded.path: {c1.path: dict(edge)},
+            c1.path: {c2.path: dict(edge)},
+            coherent.path: {s1.path: dict(edge)},
+            s1.path: {s2.path: dict(edge)},
+        },
+    }
+    profiles = {
+        start.path: profile("build_candidate", level=-2.0),
+        crowded.path: profile("drop_candidate", level=-2.0),
+        coherent.path: profile("drop_candidate", level=-18.0),
+    }
+
+    sets = setlist.make_sets(graph, live, random.Random(7), profiles=profiles)
+
+    assert sets and sets[0][0] == start.path
+    assert sets[0][1] == coherent.path
+    chosen = graph["set_plans"][0]["transitions"][0]
+    assert chosen["technical"]["measured_lock"] is True
+    assert chosen["technical"]["beats"] == 64
+    assert chosen["musical"]["preference"] == "prefer"
+    assert chosen["musical"]["incoming_section"] == "drop_candidate"
+    assert chosen["arc"]["contextual_preference"] > 0
+
+
+def test_set_builder_keeps_technical_lock_and_musical_score_separate_without_profiles():
+    records = [Record(f"/m/{i}.mp3", "Artist", f"Track {i}", 120.0, "8A", "House") for i in range(4)]
+    edge = {"beats": 64, "agree": 16, "bars": 16, "ratio": 1.0}
+    graph = {
+        "records": {},
+        "edges": {
+            records[0].path: {records[1].path: dict(edge), records[2].path: dict(edge)},
+            records[1].path: {records[2].path: dict(edge)},
+            records[2].path: {records[3].path: dict(edge)},
+        },
+    }
+    live = {r.path: r for r in records}
+    sets = setlist.make_sets(graph, live, random.Random(2))
+
+    assert sets
+    first = graph["set_plans"][0]["transitions"][0]
+    assert first["technical"]["measured_lock"] is True
+    assert first["musical"]["available"] is False
+    assert first["musical"]["score"] == 0.0
+
+
+
+def test_verify_converts_pitch_rated_source_clock_plan_to_wall_time(monkeypatch):
+    plan = SimpleNamespace(
+        playback_rate=1.06,
+        start=10.6,
+        drop=18.02,
+        length=8.48,
+        offset=0.25,
+        ratio=1.04,
+        beat=0.53,
+        done=26.5,
+    )
+    observed = {}
+
+    def check(out_path, out_ratio, in_path, in_ratio, start, offset, drop, heard, beat):
+        observed.update(
+            out_path=out_path,
+            out_ratio=out_ratio,
+            in_path=in_path,
+            in_ratio=in_ratio,
+            start=start,
+            offset=offset,
+            drop=drop,
+            heard=heard,
+            beat=beat,
+        )
+        return SimpleNamespace(locked=True, correction_ms=None)
+
+    monkeypatch.setattr(mixcheck, "check", check)
+    verdict, shift = setlist.verify("out.wav", 1.06, "in.wav", plan)
+
+    assert verdict.locked
+    assert shift == 0.0
+    assert observed["out_path"] == "out.wav"
+    assert observed["out_ratio"] == pytest.approx(1.06)
+    assert observed["in_path"] == "in.wav"
+    assert observed["in_ratio"] == pytest.approx(1.04)
+    assert observed["start"] == pytest.approx(10.0)
+    assert observed["offset"] == 0.25
+    assert observed["drop"] == pytest.approx(17.0)
+    assert observed["heard"] == pytest.approx(8.0)
+    assert observed["beat"] == pytest.approx(0.5)

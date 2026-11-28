@@ -10,7 +10,12 @@ eight bars. All of it is ffmpeg and NumPy on the CPU: no model, no VRAM.
 The free deck can also be worked by hand from the DJ booth: a record loaded
 onto it (`load`), its cue point moved (`set_cue`), played synced and on the
 beat (`play_hand`) while the faders do the mix, taking over once the record on
-air has gone quiet — or finished by Kaia (`finish`).
+air has gone quiet — or finished by Kaia (`finish`). The on-air jog platter
+also offers a momentary live pitch/phase nudge: decoded PCM is resampled at a
+bounded rate up to ±8%, the source clock advances at the actual consumed sample
+rate, and release returns to the base rate over eight rendered frames. Its
+selected PFL twin follows the same rate; this is a manual nudge, not a permanent
+pitch setting or an autonomous DJ skill.
 
 The mixer renders complete 20 ms PCM frames on a worker. A bounded
 `BufferedRecordsSource` queue sits between it and discord.py, so the voice
@@ -22,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import math
 import queue
 import random
 import re
@@ -73,9 +79,17 @@ TARGET_LUFS = -11.0
 BOOST_HEADROOM_DB = 2.0
 
 
-@functools.lru_cache(maxsize=1024)
 def gain_db(path: str) -> float:
-    """The gain that brings a record to TARGET_LUFS. 0 if it cannot be measured."""
+    """The gain for this exact audio payload, not merely this path."""
+    signature = library.audio_signature(path)
+    if signature is None:
+        return 0.0
+    return _gain_db_cached(path, signature)
+
+
+@functools.lru_cache(maxsize=1024)
+def _gain_db_cached(path: str, identity: str) -> float:
+    """EBU R128/true-peak analysis cached by path and complete audio identity."""
     try:
         out = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-i", path,
                               "-af", "ebur128=peak=true:framelog=quiet", "-f", "null", "-"],
@@ -84,10 +98,16 @@ def gain_db(path: str) -> float:
         peak = float(re.findall(r"Peak:\s*(-?[\d.]+) dBFS", out)[-1])
     except (OSError, IndexError, ValueError, subprocess.SubprocessError):
         return 0.0
+    if library.audio_signature(path, refresh=True) != identity:
+        return 0.0
     gain = TARGET_LUFS - lufs
     if gain > 0:
         gain = min(gain, max(0.0, -1.0 - peak) + BOOST_HEADROOM_DB)
     return round(max(-12.0, min(gain, 12.0)), 1)
+
+
+setattr(gain_db, "cache_clear", _gain_db_cached.cache_clear)
+setattr(gain_db, "cache_info", _gain_db_cached.cache_info)
 
 
 def open_pcm(path: str, ratio: float = 1.0, gain: float = 0.0, offset: float = 0.0,
@@ -113,6 +133,9 @@ def open_pcm(path: str, ratio: float = 1.0, gain: float = 0.0, offset: float = 0
 
 
 FRAME_SAMPLES = RATE * FRAME_MS // 1000
+#: float64: the resampler adds these to a read cursor that grows all record;
+#: in float32 it loses whole samples past 2**24 (under six minutes).
+_FRAME_SAMPLE_OFFSETS = np.arange(FRAME_SAMPLES, dtype=np.float64)
 #: The blend: this many beats from the incoming record's first downbeat to the
 #: outgoing record gone. The bass swaps halfway, on a bar.
 MIX_BEATS = 64
@@ -188,6 +211,46 @@ def _bands():
 _SOS = None
 
 
+@dataclass(frozen=True)
+class DeckLoop:
+    """A bounded, predecoded beat loop and its independent source-time clock."""
+    frames: tuple[bytes, ...]
+    start_played: int
+    start_own: float
+    end_own: float
+    beats: int
+    start_index: int = 0
+
+
+#: A momentary slip roll cannot pin a source decoder or manual hold indefinitely.
+SLIP_ROLL_MAX_FRAMES = 600
+SLIP_ROLL_RELEASE_FRAMES = 4
+
+#: Temporary live jog bend: +/-8%, 10-second fail-safe hold, smooth 8-frame release.
+PITCH_BEND_LIMIT = 0.08
+PITCH_CONTROL_LIMIT = 0.08
+PITCH_BEND_MAX_FRAMES = 500
+PITCH_BEND_RAMP_FRAMES = 8
+PITCH_BEND_BUFFER_FRAMES = 4
+#: Source-frame headroom for the longest hold at maximum positive bend plus
+#: its return ramp and a small safety margin.
+PITCH_BEND_START_HEADROOM_FRAMES = math.ceil(
+    (PITCH_BEND_MAX_FRAMES + PITCH_BEND_RAMP_FRAMES) * (1.0 + PITCH_BEND_LIMIT) + 10
+)
+
+
+@dataclass(frozen=True)
+class DeckRoll:
+    """A predecoded momentary roll while the underlying track clock keeps moving."""
+    frames: tuple[bytes, ...]
+    start_played: int
+    start_own: float
+    end_own: float
+    beats: int
+    max_frames: int = SLIP_ROLL_MAX_FRAMES
+    release_played: Optional[int] = None
+
+
 class Deck:
     """One record being decoded: frames pumped from a byte stream into a buffer.
 
@@ -214,7 +277,30 @@ class Deck:
         self.pad = max(0, int(pad))
         self.offset = max(0.0, offset)                      # seconds of the record skipped, own time
         self.total_frames = int(((seconds - self.offset) / ratio * RATE + self.pad) / FRAME_SAMPLES)
-        self.played = 0
+        self.played = 0                         # monotonic render-frame clock, even through loops and slip rolls
+        # Source time is counted in decoded 48 kHz samples. It normally equals
+        # played * 960, but live jog bend consumes source samples faster/slower.
+        self._source_samples = 0.0
+        self._bend_target = 1.0
+        self._bend_rate = 1.0
+        self._bend_ramp_remaining = 0
+        # Persistent pitch-fader rate composes with the temporary jog multiplier.
+        self._pitch_target = 1.0
+        self._pitch_rate = 1.0
+        self._pitch_ramp_remaining = 0
+        self._bend_frames = 0
+        self._bend_hold_active = False
+        self._bend_expired = False
+        self._bend_buffer_active = False
+        self._bend_capacity = PITCH_BEND_BUFFER_FRAMES * FRAME_SAMPLES + FRAME_SAMPLES * 2
+        self._bend_ring: Optional[np.ndarray] = None
+        self._bend_setup_lock = threading.Lock()
+        self._bend_read_pos = 0.0
+        self._bend_write_pos = 0
+        self._bend_pending_samples: Optional[np.ndarray] = None
+        self._bend_pending_offset = 0
+        self._loop: Optional[DeckLoop] = None
+        self._roll: Optional[DeckRoll] = None
         extra = {**({"gain": gain} if gain else {}), **({"offset": self.offset} if self.offset else {}),
                  **({"semitones": self.semitones} if self.semitones else {})}
         self._proc = stream_factory(record.path, ratio, **extra)
@@ -256,23 +342,276 @@ class Deck:
         with self._lock:
             return len(self._frames) >= frames or self._eof
 
-    def frame(self) -> Optional[bytes]:
-        """The next frame; silence if decoding is behind; None once the record is over."""
+    def _take_live_frame(self) -> Optional[bytes]:
+        """Consume one decoder frame; b"" means temporarily starved, None means EOF."""
         with self._lock:
             if self._frames:
-                self.played += 1
+                frame = self._frames.popleft()
                 self._room.release()
-                return self._frames.popleft()
+                return frame
         if self._eof:
             return None
         global DECKS_STARVED
         DECKS_STARVED += 1
-        return SILENCE
+        return b""
+
+    def prepare_bend(self) -> bool:
+        """Allocate the fixed resampler ring off the renderer's frame lock."""
+        if self._bend_ring is not None:
+            return True
+        with self._bend_setup_lock:
+            if self._bend_ring is not None:
+                return True
+            try:
+                ring = np.zeros((self._bend_capacity, 2), dtype=np.float32)
+            except MemoryError:
+                return False
+            self._bend_ring = ring
+        return True
+
+    def set_bend(self, rate: float, *, release: bool = False) -> bool:
+        """Set a temporary playback-rate multiplier; 1.0 is the neutral jog position."""
+        if isinstance(rate, bool) or not isinstance(rate, (int, float)):
+            return False
+        try:
+            target = float(rate)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(target) or not 1.0 - PITCH_BEND_LIMIT <= target <= 1.0 + PITCH_BEND_LIMIT:
+            return False
+        if target != 1.0 and (
+            self._bend_expired or self._loop is not None or self._roll is not None
+        ):
+            return False
+        if target != 1.0 and not self._bend_buffer_active:
+            if not self.prepare_bend():
+                return False
+            self._bend_buffer_active = True
+        if target != 1.0 and not self._bend_hold_active:
+            self._bend_hold_active = True
+            self._bend_frames = 0
+        if release:
+            # Only a real pointer-up / explicit hand-back opens a new hold.
+            self._bend_hold_active = False
+            self._bend_expired = False
+            self._bend_frames = 0
+        if not math.isclose(target, self._bend_target, abs_tol=1e-5):
+            self._bend_target = target
+            self._bend_ramp_remaining = PITCH_BEND_RAMP_FRAMES
+        return True
+
+    def set_pitch(self, rate: float, *, immediate: bool = False) -> bool:
+        """Set the persistent CDJ pitch-fader multiplier, independent of jog."""
+        if isinstance(rate, bool) or not isinstance(rate, (int, float)):
+            return False
+        try:
+            target = float(rate)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(target) or not 1.0 - PITCH_CONTROL_LIMIT <= target <= 1.0 + PITCH_CONTROL_LIMIT:
+            return False
+        if self._bend_hold_active or self._bend_expired or self._loop is not None or self._roll is not None:
+            return False
+        if not math.isclose(target, 1.0, abs_tol=1e-5) and not self._bend_buffer_active:
+            if not self.prepare_bend():
+                return False
+            self._bend_buffer_active = True
+        self._pitch_target = target
+        if immediate:
+            self._pitch_rate = target
+            self._pitch_ramp_remaining = 0
+        elif not math.isclose(target, self._pitch_rate, abs_tol=1e-5):
+            self._pitch_ramp_remaining = PITCH_BEND_RAMP_FRAMES
+        else:
+            self._pitch_ramp_remaining = 0
+        return True
+
+    def _bend_ensure(self, through: int) -> Optional[bool]:
+        """Append only the source samples required by the next output frame.
+
+        Complete decoded frames arrive from the pump, but unused tails remain
+        pending instead of entering the ring. This keeps a slow nudge from
+        accumulating buffered samples across repeated gestures.
+        """
+        ring = self._bend_ring
+        if ring is None:
+            return False
+        wanted = through + 1
+        while self._bend_write_pos < wanted:
+            pending = self._bend_pending_samples
+            if pending is None or self._bend_pending_offset >= FRAME_SAMPLES:
+                frame = self._take_live_frame()
+                if frame is None:
+                    return None
+                if not frame:
+                    return False
+                pending = np.frombuffer(frame, dtype=np.int16).reshape(
+                    FRAME_SAMPLES, 2
+                ).astype(np.float32)
+                self._bend_pending_samples = pending
+                self._bend_pending_offset = 0
+
+            free = int(self._bend_capacity - (self._bend_write_pos - self._bend_read_pos))
+            if free <= 0:
+                return False
+            available = FRAME_SAMPLES - self._bend_pending_offset
+            count = min(available, wanted - self._bend_write_pos, free)
+            if count <= 0:
+                return False
+
+            start = self._bend_write_pos % self._bend_capacity
+            end = start + count
+            source_start = self._bend_pending_offset
+            source_end = source_start + count
+            if end <= self._bend_capacity:
+                ring[start:end] = pending[source_start:source_end]
+            else:
+                first = self._bend_capacity - start
+                ring[start:] = pending[source_start:source_start + first]
+                ring[:end - self._bend_capacity] = pending[source_start + first:source_end]
+            self._bend_write_pos += count
+            self._bend_pending_offset = source_end
+            if self._bend_pending_offset >= FRAME_SAMPLES:
+                self._bend_pending_samples = None
+                self._bend_pending_offset = 0
+        return True
+
+    def _bent_frame(self) -> Optional[bytes]:
+        """Resample the live decoded stream at the temporary jog rate."""
+        if self._bend_hold_active:
+            self._bend_frames += 1
+            if self._bend_frames >= PITCH_BEND_MAX_FRAMES:
+                self._bend_expired = True
+                self._bend_hold_active = False
+                self._bend_target = 1.0
+                self._bend_ramp_remaining = PITCH_BEND_RAMP_FRAMES
+        if self._bend_ramp_remaining:
+            remaining = self._bend_ramp_remaining
+            self._bend_rate += (self._bend_target - self._bend_rate) / remaining
+            self._bend_ramp_remaining -= 1
+            if self._bend_ramp_remaining == 0:
+                self._bend_rate = self._bend_target
+
+        if self._pitch_ramp_remaining:
+            remaining = self._pitch_ramp_remaining
+            self._pitch_rate += (self._pitch_target - self._pitch_rate) / remaining
+            self._pitch_ramp_remaining -= 1
+            if self._pitch_ramp_remaining == 0:
+                self._pitch_rate = self._pitch_target
+
+        rate = self.playback_rate
+        positions = self._bend_read_pos + _FRAME_SAMPLE_OFFSETS * rate
+        indices = np.floor(positions).astype(np.int64)
+        needed = int(indices[-1]) + 1
+        available = self._bend_ensure(needed)
+        if available is None:
+            return None
+        if not available:
+            # b"" is temporary decoder starvation. The caller emits silence
+            # without moving the source cursor or freezing a slip roll.
+            return b""
+
+        if self._bend_ring is None:
+            return None
+        fractions = positions - indices
+        a = self._bend_ring[indices % self._bend_capacity]
+        b = self._bend_ring[(indices + 1) % self._bend_capacity]
+        mixed = a + (b - a) * fractions[:, None]
+        out = np.clip(np.rint(mixed), -32768, 32767).astype(np.int16).tobytes()
+        consumed = FRAME_SAMPLES * rate
+        self._bend_read_pos += consumed
+        self._source_samples += consumed
+        self.played += 1
+        return out
+
+    def frame(self) -> Optional[bytes]:
+        """The next PCM frame, including a slip roll or bounded live jog bend."""
+        global DECKS_STARVED
+        roll = self._roll
+        if roll is not None and self.played >= roll.start_played:
+            if roll.release_played is None and self.played - roll.start_played >= roll.max_frames:
+                # Lost pointer-up / tab switch: release itself is bounded.
+                roll = replace(roll, release_played=self.played)
+                self._roll = roll
+            index = (self.played - roll.start_played) % len(roll.frames)
+            # A slip roll repeats the prepared phrase but consumes the matching
+            # live decoder frame. On release, the live playhead is therefore
+            # exactly where it would have been without the roll.
+            if self._bend_buffer_active:
+                live = self._bent_frame()
+                if live is None:
+                    self._roll = None
+                    return None
+                if not live:
+                    return SILENCE
+            else:
+                live = self._take_live_frame()
+                if live is None:
+                    self._roll = None
+                    return None
+                if not live:
+                    return SILENCE
+                self.played += 1
+                self._source_samples += FRAME_SAMPLES
+            repeated = roll.frames[index]
+            if roll.release_played is None:
+                return repeated
+            fade_frame = self.played - roll.release_played
+            weight = min(1.0, max(0.0, fade_frame / SLIP_ROLL_RELEASE_FRAMES))
+            if weight >= 1.0:
+                self._roll = None
+                return live
+            repeated_samples = np.frombuffer(repeated, dtype=np.int16).astype(np.float32)
+            live_samples = np.frombuffer(live, dtype=np.int16).astype(np.float32)
+            mixed = repeated_samples * (1.0 - weight) + live_samples * weight
+            return np.clip(np.rint(mixed), -32768, 32767).astype(np.int16).tobytes()
+
+        loop = self._loop
+        if loop is not None and self.played >= loop.start_played:
+            index = (loop.start_index + self.played - loop.start_played) % len(loop.frames)
+            self.played += 1
+            return loop.frames[index]
+        if self._bend_buffer_active:
+            bent = self._bent_frame()
+            return SILENCE if bent == b"" else bent
+        live = self._take_live_frame()
+        if live is None:
+            return None
+        if not live:
+            return SILENCE
+        self.played += 1
+        self._source_samples += FRAME_SAMPLES
+        return live
 
     def at(self, frames: Optional[int] = None) -> float:
-        """Seconds into the record as played (stretched) at the start of frame `frames`."""
+        """Seconds into the record at the live decoded source cursor."""
         n = self.played if frames is None else frames
-        return (n * FRAME_SAMPLES - self.pad) / RATE + self.offset / self.ratio
+        loop = self._loop
+        if loop is not None and n >= loop.start_played:
+            index = (loop.start_index + n - loop.start_played) % len(loop.frames)
+            return loop.start_own / self.ratio + index / FRAMES_PER_S
+        roll = self._roll
+        if roll is not None and n >= roll.start_played:
+            index = (n - roll.start_played) % len(roll.frames)
+            return roll.start_own / self.ratio + index / FRAMES_PER_S
+        if frames is None or n == self.played:
+            samples = self._source_samples
+        elif self._bend_buffer_active:
+            samples = self._source_samples + (n - self.played) * FRAME_SAMPLES * self.playback_rate
+        else:
+            samples = n * FRAME_SAMPLES
+        return (samples - self.pad) / RATE + self.offset / self.ratio
+
+    def frame_at(self, position: float) -> tuple[int, int]:
+        """Map a decoded-source timestamp to the output frame and in-frame pad."""
+        target = (float(position) - self.offset / self.ratio) * RATE + self.pad
+        ahead = max(0.0, target - self._source_samples) / (FRAME_SAMPLES * self.playback_rate)
+        whole = int(math.floor(ahead + 1e-9))
+        pad = int(round((ahead - whole) * FRAME_SAMPLES))
+        if pad >= FRAME_SAMPLES:
+            whole += 1
+            pad = 0
+        return self.played + whole, pad
 
     @property
     def key(self) -> Optional[str]:
@@ -281,11 +620,111 @@ class Deck:
 
     @property
     def remaining(self) -> int:
-        return max(0, self.total_frames - self.played)
+        loop = self._loop
+        if loop is not None:
+            return max(0, int(round((self.end - loop.end_own / self.ratio) * FRAMES_PER_S)))
+        samples_left = max(0.0, self.total_frames * FRAME_SAMPLES - self._source_samples)
+        return int(samples_left // (FRAME_SAMPLES * self.playback_rate))
+
+    @property
+    def loop(self) -> Optional[dict]:
+        loop = self._loop
+        if loop is None:
+            return None
+        return {"beats": loop.beats, "active": self.played >= loop.start_played,
+                "start": loop.start_own, "end": loop.end_own}
+
+    @property
+    def loop_active(self) -> bool:
+        return self._loop is not None
+
+    @property
+    def roll(self) -> Optional[dict]:
+        roll = self._roll
+        if roll is None:
+            return None
+        armed = self.played < roll.start_played
+        releasing = roll.release_played is not None
+        return {
+            "beats": roll.beats,
+            "active": not armed and not releasing,
+            "armed": armed,
+            "releasing": releasing,
+            "start": roll.start_own,
+            "end": roll.end_own,
+        }
+
+    @property
+    def roll_active(self) -> bool:
+        return self._roll is not None
+
+    def stop_roll(self) -> bool:
+        """Release a slip roll at the next PCM boundary, or cancel an unstarted arm."""
+        roll = self._roll
+        if roll is None:
+            return False
+        if self.played < roll.start_played:
+            self._roll = None
+        elif roll.release_played is None:
+            self._roll = replace(roll, release_played=self.played)
+        return True
+
+    @property
+    def bend(self) -> dict:
+        return {
+            "active": self._bend_hold_active or self._bend_expired
+                      or not math.isclose(self._bend_target, 1.0, abs_tol=1e-5)
+                      or not math.isclose(self._bend_rate, 1.0, abs_tol=1e-5),
+            "expired": self._bend_expired,
+            "rate": round(self._bend_rate, 4),
+            "target": round(self._bend_target, 4),
+            "percent": round((self._bend_rate - 1.0) * 100.0, 2),
+            "target_percent": round((self._bend_target - 1.0) * 100.0, 2),
+        }
+
+    @property
+    def bend_active(self) -> bool:
+        # An expired hold still needs a physical/UI release, but once its
+        # sample rate has returned to unity it no longer owns the transport.
+        return (
+            self._bend_hold_active
+            or not math.isclose(self._bend_target, 1.0, abs_tol=1e-5)
+            or not math.isclose(self._bend_rate, 1.0, abs_tol=1e-5)
+        )
+
+    @property
+    def pitch_rate(self) -> float:
+        return self._pitch_rate
+
+    @property
+    def playback_rate(self) -> float:
+        """Decoded-source samples consumed per output sample: pitch × jog."""
+        return self._pitch_rate * self._bend_rate
+
+    @property
+    def pitch_ramping(self) -> bool:
+        return self._pitch_ramp_remaining > 0
+
+    @property
+    def pitch_control_active(self) -> bool:
+        return (self.pitch_ramping
+                or not math.isclose(self._pitch_target, 1.0, abs_tol=1e-5)
+                or not math.isclose(self._pitch_rate, 1.0, abs_tol=1e-5))
+
+    @property
+    def pitch_control(self) -> dict:
+        return {
+            "rate": round(self._pitch_rate, 4),
+            "target": round(self._pitch_target, 4),
+            "percent": round((self._pitch_target - 1.0) * 100.0, 2),
+            "ramping": self.pitch_ramping,
+            "active": self.pitch_control_active,
+        }
 
     @property
     def end(self) -> float:
-        return self.at(self.total_frames)
+        # Fixed track end; at() is intentionally loop-relative while looping.
+        return (self.total_frames * FRAME_SAMPLES - self.pad) / RATE + self.offset / self.ratio
 
     def split(self, frame: bytes) -> tuple:
         """(low, mid, presence, air) of a frame as float stereo, filtered with
@@ -367,6 +806,11 @@ class Next:
     #: her own picks ("set", "partner", "search", "pick") may be swapped for a
     #: record that locks when they do not.
     source: str = ""
+    #: A user musical preference; consumed only after the transition planner
+    #: successfully prepares this incoming deck.
+    listener_intent_id: Optional[int] = None
+    listener_intent_score: Optional[float] = None
+    listener_intent_reason: Optional[str] = None
 
 
 @dataclass
@@ -399,6 +843,8 @@ class Plan:
     #: outro starts), "break" (as it falls into its last breakdown), or ""
     #: (the last phrase the blend fits before its music ends).
     where: str = ""
+    #: Outgoing source-clock multiplier; mixcheck converts plan times to wall time.
+    playback_rate: float = 1.0
 
     @property
     def done(self) -> float:
@@ -410,7 +856,8 @@ class Plan:
 def plan_transition(now: float, out_ratio: float, out_grid, out_end: float, nxt: Next,
                     mode: str = "skip", mix_beats: int = MIX_BEATS, lead: float = 0.4,
                     allow_blend: bool = True, in_bars: Optional[int] = None,
-                    swap_at: Optional[float] = None, not_before: float = 0.0) -> Plan:
+                    swap_at: Optional[float] = None, not_before: float = 0.0,
+                    playback_rate: float = 1.0) -> Plan:
     """Plan the next transition from where the outgoing record is (`now`).
     `in_bars` cues the incoming that many bars past its bar one instead of where
     its bassline and steady beat put it (the search in `transition` tries several).
@@ -423,7 +870,8 @@ def plan_transition(now: float, out_ratio: float, out_grid, out_end: float, nxt:
     A blend needs both beats clear (BLEND_CONTRAST) and a common tempo within
     stretching range; otherwise it is a cut, which never overlaps two grooves."""
     in_grid = nxt.grid
-    playing_bpm = out_grid.bpm * out_ratio if out_grid else None
+    playback_rate = max(0.01, float(playback_rate))
+    playing_bpm = out_grid.bpm * out_ratio * playback_rate if out_grid else None
     # Steady, and with both bars known: kicks on kicks is not enough, the
     # incoming's bar one has to fall on a bar one, or its claps land on the
     # outgoing's kicks and its phrases start mid-bar.
@@ -456,7 +904,9 @@ def plan_transition(now: float, out_ratio: float, out_grid, out_end: float, nxt:
     ratio = library.tempo_ratio(playing_bpm, in_grid.bpm) if steady else None
     drifts = no_phrase = False
     if ratio is not None:
-        beat = 60.0 / playing_bpm
+        # Beat-grid locations remain in decoded-source time; the fader changes
+        # how quickly that source clock advances in wall time.
+        beat = 60.0 / (out_grid.bpm * out_ratio)
         length = mix_beats * beat
         # How long the outgoing is in it: to the swap, and its way out after.
         span = length / 2 + _tail(length, beat)
@@ -475,8 +925,8 @@ def plan_transition(now: float, out_ratio: float, out_grid, out_end: float, nxt:
         else:
             bar_in = in_grid.counted(in_grid.downbeat + late * 4 * in_grid.beat)
         offset = max(0.0, bar_in - PREROLL_S)
-        lead_in = (bar_in - offset) / ratio                  # incoming: start to the bar it drops on
-        earliest = now + lead_in + lead
+        lead_in = (bar_in - offset) / ratio * playback_rate
+        earliest = now + lead_in + lead * playback_rate
         bar = 4 * beat
 
         def out_ok(d: float) -> bool:
@@ -541,16 +991,16 @@ def plan_transition(now: float, out_ratio: float, out_grid, out_end: float, nxt:
         # their beats were tracked: a whole-record figure let a record whose
         # tempo moves a little slide off the other's kick over a long ride.
         if out_grid.ticks is not None and in_grid.ticks is not None:
-            out_beat = out_grid.local_beat(drop * out_ratio, mix_beats) / out_ratio
+            out_beat = out_grid.local_beat(drop * out_ratio, mix_beats) / (out_ratio * playback_rate)
             local = library.tempo_ratio(60.0 / out_beat, 60.0 / in_grid.local_beat(bar_in, mix_beats))
             if local is not None and abs(local / ratio - 1.0) < 0.02:
                 ratio = local
-                lead_in = (bar_in - offset) / ratio
+                lead_in = (bar_in - offset) / ratio * playback_rate
         # Decided before it starts: where both records' beats are tracked, the
         # two beats may not drift further apart than MAX_DRIFT_S over the whole
         # blend, or it is not a blend.
         if out_grid.ticks is not None and in_grid.ticks is not None:
-            out_beat = out_grid.local_beat(drop * out_ratio, mix_beats) / out_ratio
+            out_beat = out_grid.local_beat(drop * out_ratio, mix_beats) / (out_ratio * playback_rate)
             in_beat = in_grid.local_beat(bar_in, mix_beats) / ratio
             in_beat *= min((0.5, 1.0, 2.0), key=lambda k: abs(out_beat - in_beat * k))   # half/double time
             drifts = abs(out_beat - in_beat) * mix_beats > MAX_DRIFT_S
@@ -558,32 +1008,33 @@ def plan_transition(now: float, out_ratio: float, out_grid, out_end: float, nxt:
         # incoming with IN_LEFT_S still to play once it is the record on air.
         if (not drifts and drop != float("inf") and drop + span <= out_end + 0.01
                 and length <= (nxt.seconds - offset) / ratio - IN_LEFT_S):
-            return Plan("blend", drop - lead_in, drop, length, beat, ratio, nxt, offset)
+            return Plan("blend", drop - lead_in, drop, length, beat, ratio, nxt, offset,
+                        playback_rate=playback_rate)
     # Not beat-matched: a clean switch, never two grooves at once. The
     # outgoing fades over its last beat into a bar line and the incoming's first
     # beat lands exactly on it — at the playing tempo where it can be stretched
     # to it, so the pulse carries straight on.
     fallback = ("unlocked" if not allow_blend else "beat" if not steady or no_phrase else
                 ("tempo" if ratio is None else ("drift" if drifts else "room")))
-    beat = 60.0 / playing_bpm if playing_bpm else 0.5
+    beat = 60.0 / (out_grid.bpm * out_ratio) if out_grid else 0.5
     sw_ratio = (library.tempo_ratio(playing_bpm, in_grid.bpm) if out_grid and in_grid else None) or 1.0
     if mode == "end" and out_grid:
         drop = None
         for every in (8, 4, 1):
             d = out_grid.next_bar(out_end - beat - every * 4 * beat, out_ratio, every)
-            if now + lead <= d <= out_end - 0.05:
+            if now + lead * playback_rate <= d <= out_end - 0.05:
                 drop = d
                 break
-        drop = drop if drop is not None else max(now + lead, out_end - 0.05)
+        drop = drop if drop is not None else max(now + lead * playback_rate, out_end - 0.05)
     elif out_grid:
-        drop = out_grid.next_bar(now + lead, out_ratio)
+        drop = out_grid.next_bar(now + lead * playback_rate, out_ratio)
         if drop > out_end - 0.05:
-            drop = max(now + lead, out_end - 0.05)
+            drop = max(now + lead * playback_rate, out_end - 0.05)
     else:
-        drop = min(now + lead, max(now, out_end - 0.05))
+        drop = min(now + lead * playback_rate, max(now, out_end - 0.05))
     if out_grid:
         counted = out_grid.counted(drop * out_ratio) / out_ratio
-        if abs(counted - drop) < beat / 2 and now + lead / 2 <= counted <= out_end:
+        if abs(counted - drop) < beat / 2 and now + lead * playback_rate / 2 <= counted <= out_end:
             drop = counted
     # The incoming from its first beat (its bar one where counted), else its first sound.
     offset = nxt.lead
@@ -594,7 +1045,8 @@ def plan_transition(now: float, out_ratio: float, out_grid, out_end: float, nxt:
             if k < len(in_grid.ticks):
                 first = float(in_grid.ticks[k])
         offset = max(0.0, first)
-    return Plan("cut", drop, drop, min(max(beat, 0.25), 0.8), beat, sw_ratio, nxt, offset, fallback=fallback)
+    return Plan("cut", drop, drop, min(max(beat, 0.25), 0.8), beat, sw_ratio, nxt, offset,
+                fallback=fallback, playback_rate=playback_rate)
 
 
 def _ease(x):
@@ -907,6 +1359,28 @@ def mix_frames(out_parts, in_parts, g, uo=IDENTITY, ui=IDENTITY, master: float =
     return np.clip(np.rint(_soft_limit(y)), -32768, 32767).astype(np.int16).tobytes()
 
 
+def headphone_frame(cue: Optional[bytes], master: bytes, mix: float, volume: float) -> bytes:
+    """Mix the pre-fader cue and post-master program for the booth's headphones.
+
+    `mix` is 0 (CUE) to 1 (MASTER); with no cue deck, the master remains audible
+    regardless of the blend control. The final limiter protects the local output
+    when two full-level signals meet in the centre of the blend.
+    """
+    program = master if len(master) == FRAME_BYTES else SILENCE
+    m = np.frombuffer(program, dtype=np.int16).astype(np.float32).reshape(-1, 2)
+    if cue is None:
+        y = m
+    else:
+        c = np.frombuffer(cue if len(cue) == FRAME_BYTES else SILENCE,
+                          dtype=np.int16).astype(np.float32).reshape(-1, 2)
+        x = min(1.0, max(0.0, float(mix)))
+        y = c * math.cos(x * math.pi / 2.0) + m * math.sin(x * math.pi / 2.0)
+    gain = min(1.0, max(0.0, float(volume)))
+    if gain != 1.0:
+        y = y * gain
+    return np.clip(np.rint(_soft_limit(y)), -32768, 32767).astype(np.int16).tobytes()
+
+
 #: Above this level the sum is bent smoothly toward full scale rather than
 #: clipped: two full records playing together run hot.
 LIMIT_FROM = 0.80 * 32767
@@ -924,14 +1398,20 @@ def _soft_limit(y: np.ndarray) -> np.ndarray:
 
 
 class Controls:
-    """The mixer as someone at the booth has set it, on top of the automix:
-    per channel TRIM (dB), HI / MID / LOW (0 kills, 1 is flat, up to 1.5),
-    the channel fader (0–1); the crossfader (None until touched, then 0 = all
-    channel 1, 1 = all channel 2, both full in the middle); MASTER (0–1.5).
-    Kaia's automix still runs underneath: the two multiply."""
+    """The mixer state under the automix.
+
+    Channel 1/2 can be assigned to crossfader A, B or THRU. The default
+    standard curve preserves the legacy overlap law; constant-power and cut
+    are selectable. Configuration changes ramp over eight rendered frames.
+    Direct crossfader movement remains immediate so the hand follows the
+    fader rather than fighting a second automation lag.
+    """
 
     LIMITS = {"trim": (-12.0, 12.0), "high": (0.0, 1.5), "mid": (0.0, 1.5), "low": (0.0, 1.5),
               "fader": (0.0, 1.0)}
+    XFADER_CURVES = frozenset({"standard", "constant_power", "cut"})
+    XFADER_ASSIGNMENTS = frozenset({"A", "B", "THRU"})
+    XFADER_RAMP_FRAMES = 8
 
     def __init__(self):
         self.reset()
@@ -939,22 +1419,124 @@ class Controls:
     def reset(self) -> None:
         self.channels = {1: self._flat(), 2: self._flat()}
         self.xfader: Optional[float] = None
+        self.xfader_curve = "standard"
+        self.xfader_assignments = {1: "A", 2: "B"}
+        self._xfader_gains = {1: 1.0, 2: 1.0}
+        self._xfader_ramp: Optional[tuple[dict[int, float], dict[int, float], int]] = None
         self.master = 1.0
+        # Browser headphones are a separate monitor bus: output level and
+        # CUE↔MASTER balance never alter the program sent to Discord.
+        self.phones = 0.8
+        self.phones_mix = 0.0
 
     @staticmethod
     def _flat() -> dict:
         return {"trim": 0.0, "high": 1.0, "mid": 1.0, "low": 1.0, "fader": 1.0}
 
-    def set(self, slot: Optional[int], name: str, value: float) -> bool:
+    @staticmethod
+    def _number(value: float | str | None) -> Optional[float]:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return number if math.isfinite(number) else None
+
+    def _xfader_target(self, slot: int) -> float:
+        if self.xfader is None:
+            return 1.0
+        assignment = self.xfader_assignments.get(slot, "THRU")
+        if assignment == "THRU":
+            return 1.0
+        x = self.xfader
+        if self.xfader_curve == "standard":
+            # Preserve the existing booth law exactly: both decks are full
+            # around the centre and each attenuates linearly over its outer half.
+            return min(1.0, 2.0 * (1.0 - x)) if assignment == "A" else min(1.0, 2.0 * x)
+        if self.xfader_curve == "constant_power":
+            return math.cos(x * math.pi / 2.0) if assignment == "A" else math.sin(x * math.pi / 2.0)
+        # A cut curve hands the signal from A to B at the midpoint. At exactly
+        # 0.5 the B side owns the signal, so there is no ambiguous double-on frame.
+        return (1.0 if x < 0.5 else 0.0) if assignment == "A" else (0.0 if x < 0.5 else 1.0)
+
+    def _start_xfader_config_ramp(self) -> None:
+        start = dict(self._xfader_gains)
+        target = {slot: self._xfader_target(slot) for slot in (1, 2)}
+        if all(math.isclose(start[slot], target[slot], abs_tol=1e-9) for slot in (1, 2)):
+            self._xfader_gains = target
+            self._xfader_ramp = None
+            return
+        self._xfader_ramp = (start, target, 0)
+
+    def advance_frame(self) -> None:
+        """Advance configuration crossfades once per committed 20 ms PCM frame."""
+        if self._xfader_ramp is None:
+            return
+        start, target, frame = self._xfader_ramp
+        frame += 1
+        phase = min(1.0, frame / self.XFADER_RAMP_FRAMES)
+        weight = 0.5 - 0.5 * math.cos(math.pi * phase)
+        self._xfader_gains = {
+            slot: start[slot] + (target[slot] - start[slot]) * weight
+            for slot in (1, 2)
+        }
+        if frame >= self.XFADER_RAMP_FRAMES:
+            self._xfader_gains = target
+            self._xfader_ramp = None
+        else:
+            self._xfader_ramp = (start, target, frame)
+
+    def set(self, slot: Optional[int], name: str, value: float | str | None) -> bool:
         if name == "xfader":
-            self.xfader = None if value is None else min(1.0, max(0.0, float(value)))
+            if value is None:
+                self.xfader = None
+            else:
+                number = self._number(value)
+                if number is None:
+                    return False
+                self.xfader = min(1.0, max(0.0, number))
+            # The fader is a direct performance control; follow the hand now.
+            self._xfader_ramp = None
+            self._xfader_gains = {deck: self._xfader_target(deck) for deck in (1, 2)}
+            return True
+        if name == "xfader_curve":
+            curve = value.lower() if isinstance(value, str) else ""
+            if curve not in self.XFADER_CURVES:
+                return False
+            if curve != self.xfader_curve:
+                self.xfader_curve = curve
+                self._start_xfader_config_ramp()
+            return True
+        if name == "xfader_assignment":
+            assignment = value.upper() if isinstance(value, str) else ""
+            if slot is None or slot not in (1, 2) or assignment not in self.XFADER_ASSIGNMENTS:
+                return False
+            if assignment != self.xfader_assignments[slot]:
+                self.xfader_assignments[slot] = assignment
+                self._start_xfader_config_ramp()
+            return True
+        if name in ("phones", "phones_mix"):
+            if slot is not None:
+                return False
+            number = self._number(value)
+            if number is None:
+                return False
+            attr = "phones" if name == "phones" else "phones_mix"
+            setattr(self, attr, min(1.0, max(0.0, number)))
             return True
         if name == "master":
-            self.master = min(1.5, max(0.0, float(value)))
+            number = self._number(value)
+            if number is None:
+                return False
+            self.master = min(1.5, max(0.0, number))
             return True
-        if slot in self.channels and name in self.LIMITS:
+        if slot is not None and slot in self.channels and name in self.LIMITS:
+            number = self._number(value)
+            if number is None:
+                return False
             lo, hi = self.LIMITS[name]
-            self.channels[slot][name] = min(hi, max(lo, float(value)))
+            self.channels[slot][name] = min(hi, max(lo, number))
             return True
         return False
 
@@ -963,16 +1545,230 @@ class Controls:
         c = self.channels.get(slot) or self._flat()
         gain = c["fader"] * 10 ** (c["trim"] / 20)
         if self.xfader is not None:
-            gain *= min(1.0, 2 * (1 - self.xfader)) if slot == 1 else min(1.0, 2 * self.xfader)
+            gain *= self._xfader_gains.get(slot, 1.0)
         return (c["low"], c["mid"], c["high"], gain)
+
+    def channel_pre_fader(self, slot: int) -> tuple:
+        """PFL path: channel EQ and trim, deliberately before fader/crossfader."""
+        c = self.channels.get(slot) or self._flat()
+        return (c["low"], c["mid"], c["high"], 10 ** (c["trim"] / 20))
 
     def flat(self) -> bool:
         return (self.xfader is None and self.master == 1.0
                 and all(c == self._flat() for c in self.channels.values()))
 
     def state(self) -> dict:
-        return {"channels": {str(k): dict(v) for k, v in self.channels.items()},
-                "xfader": self.xfader, "master": self.master}
+        return {
+            "channels": {str(k): dict(v) for k, v in self.channels.items()},
+            "xfader": self.xfader,
+            "xfader_curve": self.xfader_curve,
+            "xfader_assignments": {str(k): v for k, v in self.xfader_assignments.items()},
+            "master": self.master,
+            "phones": self.phones,
+            "phones_mix": self.phones_mix,
+        }
+
+
+# ── bounded master effects ─────────────────────────────────────────
+# First effect: tempo-synchronised echo. Keep the processor in this shared
+# module so the standalone KaiaBooth copy needs no unsynchronised import.
+FX_MAX_DELAY_S = 5.0
+FX_MIN_BPM = 50.0
+FX_MAX_BPM = 240.0
+FX_ECHO_BEAT_CHOICES = (0.5, 1.0, 2.0, 4.0)
+FX_MAX_FEEDBACK = 0.65
+FX_MAX_WET = 0.50
+FX_PARAMETER_RAMP_FRAMES = 8
+FX_TAIL_REPEATS = 6
+FX_TAIL_FADE_FRAMES = 8
+
+
+def _fx_finite_number(value) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+class TempoEcho:
+    """A finite feedback echo on the rendered master bus.
+
+    The delay is selected from the on-air tempo when enabled. Delay length
+    cannot change while an echo or its tail is active, avoiding a moving read
+    head and discontinuous repeats. Feedback is always <= 0.65 and wet gain
+    <= 0.50. Stopping closes the input gate but lets six repeats decay, with
+    the final eight frames ramped to silence.
+    """
+
+    def __init__(self) -> None:
+        capacity = int(FX_MAX_DELAY_S * RATE) + 1
+        self._buffer = np.zeros((capacity, 2), dtype=np.float32)
+        self._offsets = np.arange(FRAME_SAMPLES, dtype=np.int64)
+        self._write = 0
+        self._delay_samples = 0
+        self._beats = 1.0
+        self._bpm = 0.0
+        self._feeding = False
+        self._tail_frames = 0
+        self._tail_fade_started = False
+        self._feedback = 0.0
+        self._wet = 0.0
+        self._feedback_from = 0.0
+        self._feedback_target = 0.0
+        self._wet_from = 0.0
+        self._wet_target = 0.0
+        self._ramp_remaining = 0
+
+    @property
+    def active(self) -> bool:
+        return self._feeding
+
+    @property
+    def tail_active(self) -> bool:
+        return not self._feeding and self._tail_frames > 0
+
+    def _start_ramp(self, feedback: float, wet: float) -> None:
+        self._feedback_from = self._feedback
+        self._feedback_target = feedback
+        self._wet_from = self._wet
+        self._wet_target = wet
+        self._ramp_remaining = FX_PARAMETER_RAMP_FRAMES
+
+    def set(
+        self,
+        enabled: bool,
+        *,
+        bpm: float | None = None,
+        beats: float = 1.0,
+        feedback: float = 0.35,
+        wet: float = 0.30,
+    ) -> bool:
+        """Start/update the echo, or stop feeding it and release its finite tail.
+
+        Invalid or unsupported parameters are rejected instead of silently
+        widening the advertised range. Enabling requires a known, plausible
+        playback BPM. A running delay can change its feedback/wet values, but
+        not its beat length; a new length is accepted after the tail clears.
+        """
+        if not isinstance(enabled, bool):
+            return False
+        if not enabled:
+            if self._feeding:
+                self._feeding = False
+                repeats = int(math.ceil(self._delay_samples / FRAME_SAMPLES))
+                self._tail_frames = repeats * FX_TAIL_REPEATS
+                self._tail_fade_started = False
+            return True
+
+        tempo = _fx_finite_number(bpm)
+        beat_count = _fx_finite_number(beats)
+        fb = _fx_finite_number(feedback)
+        wet_gain = _fx_finite_number(wet)
+        if (
+            tempo is None or not FX_MIN_BPM <= tempo <= FX_MAX_BPM
+            or beat_count not in FX_ECHO_BEAT_CHOICES
+            or fb is None or not 0.0 <= fb <= FX_MAX_FEEDBACK
+            or wet_gain is None or not 0.0 <= wet_gain <= FX_MAX_WET
+        ):
+            return False
+
+        if (self._feeding or self.tail_active) and beat_count != self._beats:
+            return False
+        delay_samples = (
+            self._delay_samples if self._feeding or self.tail_active
+            else int(round(RATE * 60.0 / tempo * beat_count))
+        )
+        if not FRAME_SAMPLES < delay_samples < len(self._buffer) - FRAME_SAMPLES:
+            return False
+
+        if not self._feeding and not self.tail_active:
+            self._buffer.fill(0.0)
+            self._write = 0
+            self._delay_samples = delay_samples
+            self._bpm = tempo
+        self._beats = beat_count
+        self._feeding = True
+        self._tail_frames = 0
+        self._tail_fade_started = False
+        self._start_ramp(fb, wet_gain)
+        return True
+
+    def process(self, frame: bytes) -> bytes:
+        """Process exactly one 20 ms stereo s16le frame; no decode or allocation growth."""
+        if len(frame) != FRAME_BYTES or (not self._feeding and not self.tail_active):
+            return frame
+
+        dry = np.frombuffer(frame, dtype=np.int16).astype(np.float32).reshape(FRAME_SAMPLES, 2)
+        if self._ramp_remaining:
+            elapsed = FX_PARAMETER_RAMP_FRAMES - self._ramp_remaining + 1
+            phase = elapsed / FX_PARAMETER_RAMP_FRAMES
+            weight = 0.5 - 0.5 * math.cos(math.pi * phase)
+            self._feedback = self._feedback_from + (
+                self._feedback_target - self._feedback_from
+            ) * weight
+            self._wet = self._wet_from + (self._wet_target - self._wet_from) * weight
+            self._ramp_remaining -= 1
+
+        write_indices = (self._write + self._offsets) % len(self._buffer)
+        read_indices = (write_indices - self._delay_samples) % len(self._buffer)
+        delayed = self._buffer[read_indices].copy()
+        if self._feeding:
+            self._buffer[write_indices] = dry + delayed * self._feedback
+        else:
+            self._buffer[write_indices] = delayed * self._feedback
+        mixed = dry + delayed * self._wet
+        self._write = (self._write + FRAME_SAMPLES) % len(self._buffer)
+
+        if not self._feeding:
+            self._tail_frames -= 1
+            if self._tail_frames <= FX_TAIL_FADE_FRAMES and not self._tail_fade_started:
+                self._tail_fade_started = True
+                self._start_ramp(0.0, 0.0)
+            if self._tail_frames <= 0:
+                self.cancel()
+        limited = _soft_limit(mixed)
+        return np.clip(np.rint(limited), -32768, 32767).astype(np.int16).tobytes()
+
+    def cancel(self) -> None:
+        """Immediately clear all delay state for hand-back, skip reset or shutdown."""
+        self._buffer.fill(0.0)
+        self._write = 0
+        self._delay_samples = 0
+        self._beats = 1.0
+        self._bpm = 0.0
+        self._feeding = False
+        self._tail_frames = 0
+        self._tail_fade_started = False
+        self._feedback = self._wet = 0.0
+        self._feedback_from = self._feedback_target = 0.0
+        self._wet_from = self._wet_target = 0.0
+        self._ramp_remaining = 0
+
+    def snapshot(self) -> dict:
+        return {
+            "enabled": self._feeding,
+            "tail": self.tail_active,
+            "beats": self._beats,
+            "bpm": round(self._bpm, 2) if self._bpm else None,
+            "delay_s": round(self._delay_samples / RATE, 4) if self._delay_samples else 0.0,
+            "feedback": round(self._feedback_target, 3),
+            "wet": round(self._wet_target, 3),
+            "tail_remaining_s": round(self._tail_frames * FRAME_MS / 1000.0, 2),
+        }
+
+
+@dataclass(frozen=True)
+class PendingLoopExit:
+    """Prepared program/PFL decoders waiting for the next loop wrap."""
+    old: Deck
+    preview: Deck
+    boundary: int
+    after_skip: bool
+    head_old: Optional[Deck]
+    head_preview: Optional[Deck]
 
 
 class CrossfadeSource(_AudioSource):
@@ -995,6 +1791,7 @@ class CrossfadeSource(_AudioSource):
         self._mix_beats = mix_beats
         self._grid_at = grid_at or _default_grid_at
         self._verify = verify
+        self._on_picked: Optional[Callable[[Next], None]] = None
         self.say: Optional[Callable[[str, str], None]] = None     # the session's feed (`dj_voice`)
         #: Other records to try, readied, when her pick will not lock with the
         #: record on air (`RecordsSession._alternatives`).
@@ -1023,6 +1820,17 @@ class CrossfadeSource(_AudioSource):
         self.history: list[dict] = []
         self.planning_mode: Optional[str] = None
         self.controls = Controls()
+        # The master FX bus runs on the buffered mixer worker, never in Discord's voice callback.
+        self.effects = TempoEcho()
+        # A private decoder feeds PFL without advancing, splitting or stealing
+        # frames from either program deck. Stream clients receive bounded PCM.
+        self._headphones_deck: Optional[Deck] = None
+        self._headphones_slot: Optional[int] = None
+        self._headphones_generation = 0
+        self._headphone_streams: list[queue.Queue[bytes]] = []
+        self._headphone_history: deque[bytes] = deque(maxlen=50)
+        # A warmed post-loop decoder is committed at the next loop boundary.
+        self._pending_loop_exit: Optional[PendingLoopExit] = None
         self.paused: set = set()                  # deck slots someone paused at the booth
         # The free deck at the booth: a record loaded by hand (`by_hand`), its
         # cue point (seconds of its own time; None: Kaia's choice), and a deck
@@ -1058,6 +1866,8 @@ class CrossfadeSource(_AudioSource):
         self._echo_cap: list = []
         self._echo_tail: Optional[np.ndarray] = None
         self._echo_pos = 0
+        from utils.audio.dj_skills import SkillScheduler
+        self.skill_scheduler = SkillScheduler()
         self._lock = threading.RLock()
         self._prefetch()
 
@@ -1088,7 +1898,7 @@ class CrossfadeSource(_AudioSource):
     def _plan_ahead(self, cur: Deck) -> float:
         """Seconds before the end of `cur` its way out is planned: room for the
         blend and the search, and for leaving at its outro or last breakdown."""
-        return self._mix_beats * 0.6 + 90 + getattr(cur, "out_lead", 0.0) / cur.ratio
+        return self._mix_beats * 0.6 + 90 + getattr(cur, "out_lead", 0.0) / (cur.ratio * getattr(cur, "pitch_rate", 1.0))
 
     def _swaps(self, deck: Deck) -> list:
         """Where the bass swap out of `deck` is tried before the end of its
@@ -1137,6 +1947,23 @@ class CrossfadeSource(_AudioSource):
             self.finish()
             return
         with self._lock:
+            loop_slot = (self.current.slot if self.current is not None and getattr(self.current, "loop_active", False)
+                         else None)
+        if loop_slot is not None:
+            threading.Thread(target=lambda: self.set_loop(loop_slot, None, after_skip=True),
+                             daemon=True, name="kaia-records-loop-skip").start()
+            return
+        with self._lock:
+            rolling_slot = self.current.slot if self.current is not None and self.current.roll_active else None
+        if rolling_slot is not None:
+            self.set_roll(rolling_slot, 1, pressed=False)
+        with self._lock:
+            bending_slot = (
+                self.current.slot if self.current is not None and self.current.bend["active"] else None
+            )
+        if bending_slot is not None:
+            self.set_bend(bending_slot, 1.0, release=True)
+        with self._lock:
             # A skip already on its way stays on its way. Planned again from now,
             # each press moved it a phrase later — and the planner's search and a
             # fresh decoder ran again every time (24 Oct: six NEXTs in nine
@@ -1168,6 +1995,7 @@ class CrossfadeSource(_AudioSource):
             return False
         incoming, self.incoming = self.incoming, None
         self.plan, self._start_frame = None, None
+        self.skill_scheduler.cancel_blend()
         if incoming:
             incoming.close()
         self._queued = self._queued or plan.nxt
@@ -1246,6 +2074,461 @@ class CrossfadeSource(_AudioSource):
             self._begin_planning(replan)
         return True
 
+    def _loop_bounds(self, grid, own: float, beats: int) -> Optional[tuple[float, float]]:
+        """Choose a two-bar-ahead phrase start and a beat-counted end."""
+        lead = own + 8 * grid.beat
+        if grid.tracked:
+            ticks = grid.ticks
+            if ticks is None:
+                return None
+            start = grid.tick_bar(lead, every=2)
+            if start is None:
+                return None
+            index = int(np.searchsorted(ticks, start - 1e-6))
+            if index >= len(ticks) or abs(float(ticks[index]) - start) > 0.025:
+                return None
+            end_index = index + beats
+            if end_index >= len(ticks):
+                return None
+            end = float(ticks[end_index])
+        else:
+            start = grid.next_bar(lead, 1.0, every=2)
+            end = start + beats * grid.beat
+        return (float(start), float(end)) if end > start else None
+
+    def set_loop(self, slot: int, beats: Optional[int], *, after_skip: bool = False) -> bool:
+        """Set a beat-quantized loop, or exit it at its next wrap boundary.
+
+        Loop audio is decoded into a bounded PCM tuple on this request thread.
+        The renderer only indexes that tuple; it never seeks, reads disk, or
+        allocates the loop buffer. Its monotonic frame counter remains separate
+        from the source-time playhead exposed by Deck.at().
+        """
+        if isinstance(slot, bool) or slot not in (1, 2):
+            return False
+        if beats is not None and (isinstance(beats, bool) or beats not in (1, 2, 4, 8)):
+            return False
+
+        if beats is None:
+            with self._lock:
+                deck = self.current if self.current is not None and self.current.slot == slot else None
+                loop = deck._loop if deck is not None else None
+                if deck is None or loop is None:
+                    return False
+                pending = self._pending_loop_exit
+                if pending is not None and pending.old is deck:
+                    if after_skip and not pending.after_skip:
+                        self._pending_loop_exit = replace(pending, after_skip=True)
+                    return True
+                if (self.plan is not None or self.incoming is not None or self._planning
+                        or self._pending_planning_mode is not None):
+                    return False
+                if deck.played < loop.start_played:
+                    deck._loop = None
+                    head = self._headphones_deck
+                    if (head is not None and self._headphones_slot == slot
+                            and head._loop is not None and head._loop.frames is loop.frames):
+                        head._loop = None
+                    plan_now = after_skip
+                    preview_source = None
+                else:
+                    plan_now = False
+                    head_old = (self._headphones_deck
+                                if self._headphones_slot == slot else None)
+                    preview_source = (deck, loop, deck.end * deck.ratio, deck.ratio,
+                                      deck.gain, deck.semitones, deck.grid, head_old)
+            if preview_source is None:
+                if plan_now:
+                    self._begin_planning("skip")
+                return True
+            old, loop, total_own, ratio, gain, semitones, grid, head_old = preview_source
+            if loop.end_own >= total_own - 0.04:
+                return False
+            preview = None
+            try:
+                preview = Deck(old.record, ratio, total_own, self._factory, gain=gain,
+                               offset=loop.end_own, semitones=semitones)
+                if not _wait_deck(preview, 5, 2.0):
+                    preview.close()
+                    return False
+            except Exception as exc:
+                if preview is not None:
+                    preview.close()
+                log_warning(f"[records] loop exit decoder could not start: {exc}")
+                return False
+            head_preview = None
+            if head_old is not None:
+                try:
+                    head_preview = Deck(old.record, ratio, total_own, self._factory, gain=gain,
+                                        offset=loop.end_own, semitones=semitones)
+                    if not _wait_deck(head_preview, 5, 2.0):
+                        head_preview.close()
+                        preview.close()
+                        return False
+                except Exception as exc:
+                    if head_preview is not None:
+                        head_preview.close()
+                    preview.close()
+                    log_warning(f"[records] headphone loop exit decoder could not start: {exc}")
+                    return False
+            assert preview is not None
+            with self._lock:
+                stale = (self.current is not old or old._loop is not loop
+                         or self.plan is not None or self.incoming is not None
+                         or self._planning or self._pending_planning_mode is not None)
+                if not stale:
+                    count = len(loop.frames)
+                    elapsed = max(0, old.played - loop.start_played)
+                    cycles = (elapsed + count - 1) // count
+                    boundary = loop.start_played + cycles * count
+                    if boundary < old.played:
+                        boundary += count
+                    if slot in self.paused:
+                        boundary = old.played
+                    self._pending_loop_exit = PendingLoopExit(
+                        old, preview, boundary, after_skip, head_old, head_preview
+                    )
+            if stale:
+                preview.close()
+                if head_preview is not None:
+                    head_preview.close()
+                return False
+            return True
+
+        with self._lock:
+            deck = self.current if self.current is not None and self.current.slot == slot else None
+            if (deck is None or deck.loop_active or deck.roll_active or deck.bend["active"] or deck.pitch_control_active or deck.grid is None or not deck.grid.bar_known
+                    or self.plan is not None or self.incoming is not None or self.hand is not None
+                    or self._planning or self._pending_planning_mode is not None
+                    or self._pending_loop_exit is not None or slot in self.paused):
+                return False
+            grid = deck.grid
+            own = max(0.0, deck.at() * deck.ratio)
+            bounds = self._loop_bounds(grid, own, beats)
+            if bounds is None:
+                return False
+            start_own, end_own = bounds
+            total_own = deck.end * deck.ratio
+            if start_own < own or end_own >= total_own - 0.04:
+                return False
+            old = deck
+            ratio, gain, semitones = deck.ratio, deck.gain, deck.semitones
+
+        loop_frames = int(round((end_own - start_own) / ratio * FRAMES_PER_S))
+        if not 1 <= loop_frames <= 500:
+            return False
+        preview = None
+        pcm: list[bytes] = []
+        try:
+            preview = Deck(old.record, ratio, end_own, self._factory,
+                           buffer_frames=max(150, loop_frames + 5), gain=gain,
+                           offset=start_own, semitones=semitones)
+            deadline = time.monotonic() + 20.0
+            while len(pcm) < loop_frames and time.monotonic() < deadline:
+                if preview.ready(1):
+                    frame = preview.frame()
+                    if frame is None:
+                        break
+                    pcm.append(frame)
+                else:
+                    time.sleep(0.005)
+            if len(pcm) != loop_frames:
+                return False
+        except Exception as exc:
+            log_warning(f"[records] loop buffer could not be prepared: {exc}")
+            return False
+        finally:
+            if preview is not None:
+                preview.close()
+
+        with self._lock:
+            head = (self._headphones_deck
+                    if self._headphones_slot == slot else None)
+            stale = (
+                self.current is not old or old.loop_active or old.roll_active
+                or old.bend["active"] or old.pitch_control_active
+                or self.plan is not None or self.incoming is not None or self.hand is not None
+                or self._planning or self._pending_planning_mode is not None
+                or self._pending_loop_exit is not None or slot in self.paused
+                or (head is not None and (
+                    head.loop_active or head.roll_active
+                    or head.bend["active"] or head.pitch_control_active
+                ))
+            )
+            frames_until = int(round((start_own / ratio - old.at()) * FRAMES_PER_S))
+            if not stale and frames_until >= 2:
+                loop_frames_pcm = tuple(pcm)
+                old._loop = DeckLoop(loop_frames_pcm, old.played + frames_until,
+                                     start_own, end_own, beats)
+                if head is not None:
+                    head._loop = DeckLoop(loop_frames_pcm, head.played + frames_until,
+                                          start_own, end_own, beats)
+        if stale or frames_until < 2:
+            return False
+        log_info(f"[records] deck {slot} armed a {beats}-beat loop at {start_own:.3f}s")
+        return True
+
+    def _roll_bounds(self, grid, own: float, beats: int) -> Optional[tuple[float, float]]:
+        """Choose the next counted bar and a bounded 1/2/4/8-beat roll segment."""
+        if grid is None or not grid.bar_known:
+            return None
+        lead = own + 2 * grid.beat
+        if grid.tracked:
+            ticks = grid.ticks
+            if ticks is None:
+                return None
+            start = grid.tick_bar(lead, every=1)
+            if start is None:
+                return None
+            index = int(np.searchsorted(ticks, start - 1e-6))
+            if index >= len(ticks) or abs(float(ticks[index]) - start) > 0.025:
+                return None
+            end_index = index + beats
+            if end_index >= len(ticks):
+                return None
+            end = float(ticks[end_index])
+        else:
+            start = grid.next_bar(lead, 1.0, every=1)
+            end = start + beats * grid.beat
+        return (float(start), float(end)) if end > start else None
+
+    def set_roll(self, slot: int, beats: int, *, pressed: bool) -> bool:
+        """Arm or release a momentary slip roll on the on-air deck.
+
+        The roll phrase is decoded on this request thread. While it repeats,
+        each output frame also consumes the matching frame from the live deck
+        decoder, keeping the underlying source clock moving. Release blends
+        back to that live position over four frames. A hard hold timeout is
+        enforced in Deck.frame() if the browser loses its pointer-up event.
+        """
+        if isinstance(slot, bool) or slot not in (1, 2) or not isinstance(pressed, bool):
+            return False
+        if pressed and (isinstance(beats, bool) or beats not in (1, 2, 4, 8)):
+            return False
+
+        if not pressed:
+            with self._lock:
+                deck = self.current if self.current is not None and self.current.slot == slot else None
+                if deck is None:
+                    return False
+                if not deck.roll_active:
+                    return True  # pointer-up after a failed/too-early arm is harmless
+                deck.stop_roll()
+                head = (self._headphones_deck
+                        if self._headphones_slot == slot else None)
+                if head is not None:
+                    head.stop_roll()
+            return True
+
+        with self._lock:
+            deck = self.current if self.current is not None and self.current.slot == slot else None
+            if (deck is None or deck.loop_active or deck.roll_active or deck.bend["active"] or deck.pitch_control_active or deck.grid is None
+                    or not deck.grid.bar_known or self.plan is not None or self.incoming is not None
+                    or self.hand is not None or self._planning or self._pending_planning_mode is not None
+                    or self._pending_loop_exit is not None or slot in self.paused):
+                return False
+            grid = deck.grid
+            own = max(0.0, deck.at() * deck.ratio)
+            bounds = self._roll_bounds(grid, own, beats)
+            if bounds is None:
+                return False
+            start_own, end_own = bounds
+            total_own = deck.end * deck.ratio
+            if start_own < own or end_own >= total_own - 0.04:
+                return False
+            old = deck
+            ratio, gain, semitones = deck.ratio, deck.gain, deck.semitones
+            head_old = (
+                self._headphones_deck
+                if self._headphones_slot == slot
+                else None
+            )
+
+        roll_frames = int(round((end_own - start_own) / ratio * FRAMES_PER_S))
+        if not 1 <= roll_frames <= 500:
+            return False
+
+        preview = None
+        pcm: list[bytes] = []
+        try:
+            preview = Deck(
+                old.record, ratio, end_own, self._factory,
+                buffer_frames=max(150, roll_frames + 5), gain=gain,
+                offset=start_own, semitones=semitones,
+            )
+            deadline = time.monotonic() + 20.0
+            while len(pcm) < roll_frames and time.monotonic() < deadline:
+                if preview.ready(1):
+                    frame = preview.frame()
+                    if frame is None:
+                        break
+                    pcm.append(frame)
+                else:
+                    time.sleep(0.005)
+            if len(pcm) != roll_frames:
+                return False
+        except Exception as exc:
+            log_warning(f"[records] slip-roll PCM could not be prepared: {exc}")
+            return False
+        finally:
+            if preview is not None:
+                preview.close()
+
+        with self._lock:
+            stale = (
+                self.current is not old or old.loop_active or old.roll_active
+                or old.bend["active"] or old.pitch_control_active
+                or self.plan is not None or self.incoming is not None or self.hand is not None
+                or self._planning or self._pending_planning_mode is not None
+                or self._pending_loop_exit is not None or slot in self.paused
+            )
+            frames_until = int(round((start_own / ratio - old.at()) * FRAMES_PER_S))
+            head_frames_until = (
+                int(round((start_own / ratio - head_old.at()) * FRAMES_PER_S))
+                if head_old is not None else None
+            )
+            enough_live_audio = (
+                old.remaining > frames_until + SLIP_ROLL_MAX_FRAMES + SLIP_ROLL_RELEASE_FRAMES + 5
+            )
+            head_stale = (
+                head_old is not None
+                and (self._headphones_deck is not head_old or self._headphones_slot != slot
+                     or head_old.roll_active or head_old.loop_active
+                     or head_old.bend["active"] or head_old.pitch_control_active)
+            )
+            if (not stale and not head_stale and frames_until >= 2 and enough_live_audio
+                    and (head_frames_until is None or head_frames_until >= 2)):
+                frames = tuple(pcm)
+                old._roll = DeckRoll(
+                    frames, old.played + frames_until, start_own, end_own, beats,
+                )
+                if head_old is not None and head_frames_until is not None:
+                    head_old._roll = DeckRoll(
+                        frames, head_old.played + head_frames_until, start_own, end_own, beats,
+                    )
+            else:
+                stale = True
+
+        if stale:
+            return False
+        log_info(f"[records] deck {slot} armed a {beats}-beat slip roll at {start_own:.3f}s")
+        return True
+
+    def jump_to_cue(self, slot: int, position: float, expected_path: Optional[str] = None) -> bool:
+        """Jump a deck to a saved source-time cue without disturbing the voice clock.
+
+        The replacement decoder is opened and warmed on the booth request thread.
+        The swap itself is committed under the renderer lock at a 20 ms frame
+        boundary; the retired decoder is closed after releasing that lock.
+        A cue cannot take ownership away from an active transition, and an HTTP
+        request can bind the jump to the record whose cue bank it just read.
+        """
+        if isinstance(slot, bool) or slot not in (1, 2):
+            return False
+        try:
+            target = float(position)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(target) or target < 0:
+            return False
+
+        with self._lock:
+            if self.blend_started():
+                return False
+            owner = ("current" if self.current is not None and self.current.slot == slot
+                     else "hand" if self.hand is not None and self.hand.slot == slot else None)
+            deck = self.current if owner == "current" else self.hand if owner == "hand" else None
+            queued = self._queued if owner is None and self.free_slot() == slot else None
+            if owner is None:
+                # Do not cancel a plan just to edit a deck that is currently
+                # incoming; its transition owns the free channel until release.
+                if queued is None or self.plan is not None or self.incoming is not None:
+                    return False
+                assert queued is not None
+                if expected_path is not None and queued.record.path != expected_path:
+                    return False
+                self._gen += 1
+                self.cue = min(target, max(0.0, queued.seconds - 0.04))
+                self.by_hand = True
+                self.skill_scheduler.clear_active()
+                self.gesture = ""
+                return True
+            if deck is None:
+                return False
+            if (deck.loop_active or deck.roll_active or deck.bend["active"] or deck.pitch_ramping
+                    or (self._pending_loop_exit is not None and self._pending_loop_exit.old is deck)):
+                return False
+            if expected_path is not None and deck.record.path != expected_path:
+                return False
+
+            replan = self.plan.mode if self.plan is not None else self.planning_mode
+            if self.plan is not None:
+                self._call_off_plan()
+            self._gen += 1
+            generation = self._gen
+            seconds = max(0.0, deck.end * deck.ratio)
+            if seconds <= 0.04:
+                return False
+            target = min(target, seconds - 0.04)
+            record, ratio, gain, semitones = deck.record, deck.ratio, deck.gain, deck.semitones
+            pitch_rate = deck.pitch_rate
+            old_deck = deck
+            if self._splice is not None:
+                self._cancel_splice()
+            self.skill_scheduler.clear_active()
+            self.gesture = ""
+
+        preview = None
+        try:
+            preview = Deck(record, ratio, seconds, self._factory, gain=gain,
+                           offset=target, semitones=semitones)
+            if not preview.set_pitch(pitch_rate, immediate=True):
+                preview.close()
+                return False
+            if not _wait_deck(preview, 5, 1.0):
+                preview.close()
+                return False
+        except Exception as exc:
+            if preview is not None:
+                preview.close()
+            log_warning(f"[records] hot cue decoder could not start: {exc}")
+            return False
+
+        with self._lock:
+            active = (self.current is old_deck) if owner == "current" else (self.hand is old_deck)
+            stale = (generation != self._gen or not active or self.blend_started()
+                     or self._splice is not None
+                     or not math.isclose(old_deck.pitch_rate, pitch_rate, rel_tol=1e-6, abs_tol=1e-6)
+                     or old_deck.pitch_ramping
+                     or (expected_path is not None and old_deck.record.path != expected_path))
+            if not stale:
+                preview.grid = old_deck.grid
+                preview.slot = old_deck.slot
+                preview.outs = old_deck.outs
+                preview.out_lead = old_deck.out_lead
+                preview._scouting = False
+                if owner == "current":
+                    self.current = preview
+                else:
+                    self.hand = preview
+                    self.cue = target
+        if stale:
+            preview.close()
+            return False
+
+        assert preview is not None
+        old_deck.close()
+        # A selected PFL decoder belongs to the same deck/cue point. Rebuild it
+        # from the committed on-air decoder so its source cursor and pitch agree.
+        with self._lock:
+            refresh_headphones = owner == "current" and self._headphones_slot == slot
+        if refresh_headphones and not self.set_headphones(slot, force=True):
+            log_warning(f"[records] PFL decoder could not follow deck {slot}'s hot cue")
+        if replan:
+            self._begin_planning(replan)
+        log_info(f"[records] deck {slot} jumped to hot cue at {target:.3f}s")
+        return True
+
     def _cued(self, nxt: Next) -> Next:
         """`nxt` as it comes in from the cue point: bar one at the cue. A cue
         set at the booth is kept whoever lined the record up."""
@@ -1276,6 +2559,7 @@ class CrossfadeSource(_AudioSource):
             if nxt is None or cur is None:
                 return "nothing"
             self._hand_starting = True
+            self.skill_scheduler.clear_active()
             gen = self._gen
             cue = self.cue if self.cue is not None else self.default_cue(nxt)
 
@@ -1301,7 +2585,7 @@ class CrossfadeSource(_AudioSource):
             _SOS = _bands()
         in_g = self._grid_at(nxt.record, max(0.0, cue - 4.0), 30.0) or nxt.grid
         out_g = self._grid_at(cur.record, max(0.0, cur.at() * cur.ratio - 8.0), 30.0) or cur.grid
-        master_bpm = out_g.bpm * cur.ratio if out_g else None
+        master_bpm = out_g.bpm * cur.ratio * cur.pitch_rate if out_g else None
         ratio = library.tempo_ratio(master_bpm, in_g.bpm if in_g else nxt.record.bpm)
         synced = ratio is not None and in_g is not None and out_g is not None
         ratio = ratio or 1.0
@@ -1314,15 +2598,13 @@ class CrossfadeSource(_AudioSource):
             lead = 0.8 + 0.5 * attempt
             if synced and cur.slot not in self.paused:
                 bm, first = out_g.beat / cur.ratio, out_g.downbeat / cur.ratio
-                j = int(np.ceil((cur.at() + lead - first) / bm))
+                j = int(np.ceil((cur.at() + lead * cur.pitch_rate - first) / bm))
                 while phase is not None and j % 4 != phase:
                     j += 1
                 when = first + j * bm
             else:
-                when = cur.at() + lead
-            at = (when - cur.offset / cur.ratio) * RATE + cur.pad
-            k = int(np.floor(at / FRAME_SAMPLES))
-            pad = int(round(at - k * FRAME_SAMPLES))
+                when = cur.at() + lead * cur.pitch_rate
+            k, pad = cur.frame_at(when)
             deck = Deck(nxt.record, ratio, nxt.seconds, self._factory, gain=nxt.gain, pad=max(0, pad), offset=c,
                         semitones=self._semitones(cur, nxt) if synced else 0)
             deadline = time.time() + 1.0
@@ -1381,10 +2663,11 @@ class CrossfadeSource(_AudioSource):
                 return False
             g = cur.grid
             beat = g.beat / cur.ratio if g else 0.5
-            drop = g.next_bar(cur.at() + 0.3, cur.ratio) if g else cur.at() + 0.3
+            drop = g.next_bar(cur.at() + 0.3 * cur.pitch_rate, cur.ratio) if g else cur.at() + 0.3 * cur.pitch_rate
             length = max(beat, min(FINISH_BARS * 4 * beat, cur.end - drop - 0.05))
             nxt = self.hand_next or Next(hand.record, hand.total_frames / FRAMES_PER_S, source="hand")
-            plan = Plan("out", drop, drop, length, beat, hand.ratio, nxt, mode="skip", why="finishing the mix by hand")
+            plan = Plan("out", drop, drop, length, beat, hand.ratio, nxt, mode="skip",
+                        why="finishing the mix by hand", playback_rate=cur.pitch_rate)
             self.incoming, self.plan = hand, plan
             self._start_frame = 0 if self._hand_on else self._hand_k
             self.hand, self.hand_next, self._hand_k, self._hand_on = None, None, None, False
@@ -1401,6 +2684,8 @@ class CrossfadeSource(_AudioSource):
     def _adopt_hand(self) -> None:
         """The deck played by hand is the record on air now."""
         old, hand = self.current, self.hand
+        if hand is None:
+            return
         self._cancel_splice()
         self._glide_next = self.frames_sent + int(GLIDE_AFTER_BARS * 2 * FRAMES_PER_S)
         self.current = hand
@@ -1447,6 +2732,136 @@ class CrossfadeSource(_AudioSource):
             self._begin_planning(replan)
         return True
 
+    def set_control(self, slot: Optional[int], name: str, value) -> bool:
+        """Apply a booth control and transfer that lane's automation ownership to the user."""
+        with self._lock:
+            ok = self.controls.set(slot, name, value)
+            if not ok:
+                return False
+            current = self.current
+            at = current.at() if current is not None else 0.0
+            bar_s = (
+                4.0 * current.grid.beat / max(0.01, current.ratio)
+                if current is not None and current.grid is not None else 2.0
+            )
+            if (slot in self.controls.channels and name in self.controls.LIMITS
+                    and isinstance(value, (int, float)) and not isinstance(value, bool)):
+                self.skill_scheduler.manual_override(slot, name, at, bar_s, float(value))
+            return True
+
+    def set_bend(self, slot: int, rate: float, *, release: bool = False) -> bool:
+        """Apply a live temporary jog rate to the on-air deck and its PFL twin.
+
+        The rate is a playback multiplier (0.92–1.08). One is neutral. Release
+        is always accepted for the current deck so a transition/skip can hand
+        ownership back even after the initiating browser gesture ends.
+        """
+        if isinstance(slot, bool) or slot not in (1, 2):
+            return False
+        if isinstance(rate, bool) or not isinstance(rate, (int, float)):
+            return False
+        try:
+            target = float(rate)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(target) or not 1.0 - PITCH_BEND_LIMIT <= target <= 1.0 + PITCH_BEND_LIMIT:
+            return False
+        with self._lock:
+            deck = self.current if self.current is not None and self.current.slot == slot else None
+            if deck is None:
+                return False
+            head = self._headphones_deck if self._headphones_slot == slot else None
+        if not math.isclose(target, 1.0, abs_tol=1e-5):
+            # Allocate bounded DSP memory on the HTTP thread, not while holding
+            # the frame-boundary lock needed by the audio renderer.
+            if not deck.prepare_bend() or (head is not None and not head.prepare_bend()):
+                return False
+        with self._lock:
+            current_head = self._headphones_deck if self._headphones_slot == slot else None
+            if self.current is not deck or current_head is not head:
+                return False
+            if math.isclose(target, 1.0, abs_tol=1e-5):
+                ok = deck.set_bend(1.0, release=release)
+                if head is not None:
+                    ok = head.set_bend(1.0, release=release) and ok
+                return ok
+            if (
+                deck.loop_active or deck.roll_active
+                or self.plan is not None or self.incoming is not None or self.hand is not None
+                or self._planning or self._pending_planning_mode is not None or self._gliding
+                or self._pending_loop_exit is not None or slot in self.paused
+                or self._splice is not None
+                or (not deck._bend_hold_active
+                    and deck.remaining <= PITCH_BEND_START_HEADROOM_FRAMES)
+            ):
+                return False
+            if head is not None and (head.loop_active or head.roll_active):
+                return False
+            if not deck.set_bend(target):
+                return False
+            if head is not None and not head.set_bend(target):
+                deck.set_bend(1.0, release=True)
+                return False
+            return True
+
+    def set_pitch(self, slot: int, rate: float) -> bool:
+        """Set a persistent ±8% pitch ride on the on-air deck and its selected PFL twin."""
+        if isinstance(slot, bool) or slot not in (1, 2):
+            return False
+        if isinstance(rate, bool) or not isinstance(rate, (int, float)):
+            return False
+        try:
+            target = float(rate)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(target) or not 1.0 - PITCH_CONTROL_LIMIT <= target <= 1.0 + PITCH_CONTROL_LIMIT:
+            return False
+        with self._lock:
+            deck = self.current if self.current is not None and self.current.slot == slot else None
+            if deck is None:
+                return False
+            head = self._headphones_deck if self._headphones_slot == slot else None
+        if not math.isclose(target, 1.0, abs_tol=1e-5):
+            if not deck.prepare_bend() or (head is not None and not head.prepare_bend()):
+                return False
+        with self._lock:
+            current_head = self._headphones_deck if self._headphones_slot == slot else None
+            if self.current is not deck or current_head is not head:
+                return False
+            if (deck.loop_active or deck.roll_active or deck.bend_active
+                    or self.effects.active or self.effects.tail_active
+                    or self.plan is not None or self.incoming is not None or self.hand is not None
+                    or self._planning or self._pending_planning_mode is not None or self._gliding
+                    or self._pending_loop_exit is not None or slot in self.paused or self._splice is not None):
+                return False
+            if head is not None and (head.loop_active or head.roll_active or head.bend_active):
+                return False
+            if not deck.set_pitch(target):
+                return False
+            if head is not None and not head.set_pitch(target):
+                deck.set_pitch(1.0)
+                return False
+            return True
+
+    def set_echo(self, enabled: bool, beats: float = 1.0,
+                 feedback: float = 0.35, wet: float = 0.30) -> bool:
+        """Control the real master echo using the current on-air playback tempo."""
+        with self._lock:
+            if not enabled:
+                return self.effects.set(False)
+            current = self.current
+            if current is None:
+                return False
+            playback_rate = current.ratio * current.playback_rate
+            bpm = (
+                current.grid.bpm * playback_rate
+                if current.grid is not None
+                else (current.record.bpm or 0.0) * playback_rate
+            )
+            return self.effects.set(
+                True, bpm=bpm, beats=beats, feedback=feedback, wet=wet
+            )
+
     @staticmethod
     def _db(frame: Optional[bytes]) -> float:
         if not frame:
@@ -1468,7 +2883,8 @@ class CrossfadeSource(_AudioSource):
                 elif self.plan is None and self._pending_planning_mode is None:
                     self._pending_planning_mode = mode
                 return
-            if self.plan or self.current is None or self.hand is not None or self._hand_starting:
+            if (self.plan or self.current is None or self.hand is not None or self._hand_starting
+                    or getattr(self.current, "pitch_ramping", False)):
                 return
             self._planning = True
             self.planning_mode = mode
@@ -1515,7 +2931,8 @@ class CrossfadeSource(_AudioSource):
                                                music_end, nxt, mode, self._mix_beats, lead=lead,
                                                verify_fn=verify, budget_s=SEARCH_S.get(mode, 3.0),
                                                lengths=blend_lengths(self._mix_beats, deck.key, incoming_key(nxt)),
-                                               swaps=self._swaps(deck) if mode == "end" else ())
+                                               swaps=self._swaps(deck) if mode == "end" else (),
+                                               out_rate=deck.pitch_rate)
                     if found is None and attempt == 0 and nxt.source not in ("hand", "request") and self.alternatives:
                         # Her own pick does not lock anywhere: another record that does.
                         until = time.time() + ALTERNATIVE_S.get(mode, 6.0)
@@ -1527,7 +2944,8 @@ class CrossfadeSource(_AudioSource):
                                                        alt, mode, self._mix_beats, lead=lead, verify_fn=verify,
                                                        budget_s=max(0.5, until - time.time()),
                                                        lengths=blend_lengths(self._mix_beats, deck.key, incoming_key(alt)),
-                                                       swaps=self._swaps(deck) if mode == "end" else ())
+                                                       swaps=self._swaps(deck) if mode == "end" else (),
+                                               out_rate=deck.pitch_rate)
                                 if f is not None:
                                     swapped_from, nxt, found = nxt, alt, f
                                     break
@@ -1539,21 +2957,20 @@ class CrossfadeSource(_AudioSource):
                         # Nothing locks: an echo-out on the bar, never two grooves
                         # laid over each other and never a bare cut.
                         plan = plan_transition(deck.at(), deck.ratio, out_grid, music_end, nxt, mode,
-                                               self._mix_beats, lead=lead)
+                                               self._mix_beats, lead=lead,
+                                               playback_rate=deck.pitch_rate)
                         if plan.kind == "blend":             # it fits, but locks nowhere
                             plan = plan_transition(deck.at(), deck.ratio, out_grid, music_end, nxt, mode,
-                                                   self._mix_beats, lead=lead, allow_blend=False)
+                                                   self._mix_beats, lead=lead, allow_blend=False,
+                                                   playback_rate=deck.pitch_rate)
                             plan.check = "no common beat anywhere it could be mixed"
                         plan = as_echo(plan)
                     # A stretch that moves onsets early is started that much
                     # later (only the atempo fallback does; rubberband does not).
                     from utils.audio.beatgrid import stretch_latency
-                    plan.start += stretch_latency(plan.ratio) - stretch_latency(deck.ratio)
-                    # It starts part-way into its first frame, so its downbeat
-                    # lands on the outgoing bar to the sample.
-                    at = (plan.start - deck.offset / deck.ratio) * RATE + deck.pad   # outgoing samples
-                    k = int(np.floor(at / FRAME_SAMPLES))
-                    pad = int(round(at - k * FRAME_SAMPLES))
+                    plan.start += (stretch_latency(plan.ratio) - stretch_latency(deck.ratio)) * deck.pitch_rate
+                    # A rate-controlled source cursor can cross a decoded frame boundary early.
+                    k, pad = deck.frame_at(plan.start)
                     incoming = Deck(nxt.record, plan.ratio, nxt.seconds, self._factory,
                                     gain=nxt.gain, pad=max(0, pad), offset=plan.offset,
                                     semitones=self._semitones(deck, nxt))
@@ -1578,6 +2995,13 @@ class CrossfadeSource(_AudioSource):
                     self._start_frame = k
                     self.incoming = incoming
                     self.plan = plan
+                    self.skill_scheduler.plan_blend(plan, self.energy, ramp(plan), tail(plan))
+
+                if nxt.listener_intent_id is not None and self._on_picked is not None:
+                    try:
+                        self._on_picked(nxt)
+                    except Exception as e:
+                        log_debug(f"[records] listener intent completion: {e}")
 
                 why = ""
                 if plan.kind != "blend":
@@ -1664,15 +3088,274 @@ class CrossfadeSource(_AudioSource):
                       + ("" if abs(shift) <= MAX_FINE_S else " (too far to trust; kept the grid's alignment)"))
         return shift
 
-    def read(self) -> bytes:
-        """Render one complete frame from a single committed mixer state."""
+    def _headphone_descriptor_locked(self, slot: int):
+        """Resolve a booth slot to an authoritative decoder description."""
+        for deck in (self.current, self.incoming, self.hand):
+            if deck is not None and deck.slot == slot:
+                return (deck.record, deck.ratio, max(deck.end * deck.ratio, deck.at() * deck.ratio + 0.02),
+                        deck.gain, max(0.0, deck.at() * deck.ratio), deck.semitones, deck.pitch_rate)
+        queued = self._queued if self.free_slot() == slot else None
+        if queued is None or self.current is None:
+            return None
+        from utils.audio import library
+        current = self.current
+        master_bpm = current.grid.bpm * current.ratio * current.pitch_rate if current.grid else (current.record.bpm or 0) * current.ratio * current.pitch_rate
+        bpm = queued.grid.bpm if queued.grid else queued.record.bpm
+        ratio = library.tempo_ratio(master_bpm, bpm) or 1.0
+        offset = self.cue if self.cue is not None else self.default_cue(queued)
+        return (queued.record, ratio, queued.seconds, queued.gain, max(0.0, offset), 0, 1.0)
+
+    def set_headphones(self, slot: Optional[int], force: bool = False) -> bool:
+        """Select a deck's independent PFL decoder, or turn CUE off.
+
+        Decoder creation and warm-up happen on the HTTP request thread, never in
+        the render worker. A generation token prevents a slow obsolete request
+        from replacing a newer selection. Force rebuilds after a cue seek.
+        """
+        if slot is None:
+            with self._lock:
+                self._headphones_generation += 1
+                old, self._headphones_deck = self._headphones_deck, None
+                self._headphones_slot = None
+            if old is not None:
+                old.close()
+            return True
+        if isinstance(slot, bool) or slot not in (1, 2):
+            return False
         with self._lock:
-            return self._read_locked()
+            pending_exit = self._pending_loop_exit
+            if pending_exit is not None and pending_exit.old.slot == slot:
+                return False
+            if self.current is not None and self.current.slot == slot and (
+                self.current.roll_active or self.current.bend["active"] or getattr(self.current, "pitch_ramping", False)
+            ):
+                # A new PFL decoder cannot inherit a live roll/jog cursor or a changing pitch ramp.
+                return False
+            desc = self._headphone_descriptor_locked(slot)
+            if desc is None:
+                return False
+            if (not force and self._headphones_deck is not None and self._headphones_slot == slot
+                    and self._headphones_deck.record.path == desc[0].path):
+                return True
+            self._headphones_generation += 1
+            generation = self._headphones_generation
+        record, ratio, seconds, gain, offset, semitones, pitch_rate = desc
+        preview = None
+        try:
+            preview = Deck(record, ratio, seconds, self._factory, gain=gain,
+                           offset=offset, semitones=semitones)
+            if not preview.set_pitch(pitch_rate, immediate=True):
+                preview.close()
+                return False
+            if not _wait_deck(preview, 5, 1.0):
+                preview.close()
+                return False
+        except Exception as exc:
+            if preview is not None:
+                preview.close()
+            log_warning(f"[records] headphone decoder could not start: {exc}")
+            return False
+        with self._lock:
+            current = self._headphone_descriptor_locked(slot)
+            program = self.current if self.current is not None and self.current.slot == slot else None
+            stale = (generation != self._headphones_generation or current is None
+                     or current[0].path != record.path
+                     or not math.isclose(current[1], ratio, rel_tol=1e-6, abs_tol=1e-6)
+                     or not math.isclose(current[6], pitch_rate, rel_tol=1e-6, abs_tol=1e-6)
+                     # A target can change before the next render frame moves
+                     # pitch_rate. The preview captured the old rate, so reject
+                     # it while the program deck has any ramp still in flight.
+                     or (program is not None and (program.pitch_ramping or program.bend_active)))
+            target_at = max(0.0, current[4] / current[1]) if not stale else 0.0
+            delta_frames = int(round((target_at - preview.at()) * FRAMES_PER_S / preview.playback_rate))
+            if delta_frames < -1 or delta_frames > 145:
+                stale = True
+            skip_frames = max(0, delta_frames)
+        # Catch up by rendering the preview through its own resampler. Popping
+        # decoded frames directly would leave the ring's read cursor at zero and
+        # make a newly selected PFL deck audibly jump back to its beginning.
+        for _ in range(4):
+            with self._lock:
+                current = self._headphone_descriptor_locked(slot)
+                program = self.current if self.current is not None and self.current.slot == slot else None
+                stale = (generation != self._headphones_generation or current is None
+                         or current[0].path != record.path
+                         or not math.isclose(current[1], ratio, rel_tol=1e-6, abs_tol=1e-6)
+                         or not math.isclose(current[6], pitch_rate, rel_tol=1e-6, abs_tol=1e-6)
+                         or (program is not None and (program.pitch_ramping or program.bend_active)))
+                if not stale:
+                    target_at = max(0.0, current[4] / current[1])
+                    delta_frames = int(round(
+                        (target_at - preview.at()) * FRAMES_PER_S / preview.playback_rate
+                    ))
+                    if delta_frames < -1 or delta_frames > 145:
+                        stale = True
+                    else:
+                        skip_frames = max(0, delta_frames)
+            if stale or not skip_frames:
+                break
+            # _bend_ensure consumes approximately skip_frames × playback_rate
+            # decoded frames, plus interpolation/look-ahead headroom.
+            required = int(math.ceil(skip_frames * preview.playback_rate)) + 5
+            if not _wait_deck(preview, required, 1.0):
+                stale = True
+                break
+            for _frame in range(skip_frames):
+                rendered = preview.frame()
+                if not rendered:
+                    stale = True
+                    break
+            if stale:
+                break
+        with self._lock:
+            current = self._headphone_descriptor_locked(slot)
+            program = self.current if self.current is not None and self.current.slot == slot else None
+            stale = (stale or generation != self._headphones_generation or current is None
+                     or current[0].path != record.path
+                     or not math.isclose(current[1], ratio, rel_tol=1e-6, abs_tol=1e-6)
+                     or not math.isclose(current[6], pitch_rate, rel_tol=1e-6, abs_tol=1e-6)
+                     or (program is not None and (program.pitch_ramping or program.bend_active)))
+            if not stale:
+                target_at = max(0.0, current[4] / current[1])
+                delta_frames = int(round(
+                    (target_at - preview.at()) * FRAMES_PER_S / preview.playback_rate
+                ))
+                if delta_frames < -1 or delta_frames > 1:
+                    stale = True
+            if not stale:
+                program = self.current if self.current is not None and self.current.slot == slot else None
+                if program is not None:
+                    loop = program._loop
+                    if loop is not None:
+                        if program.played >= loop.start_played:
+                            loop_index = (program.played - loop.start_played) % len(loop.frames)
+                            loop_start_frame = preview.played
+                        else:
+                            loop_index = 0
+                            loop_start_frame = preview.played + loop.start_played - program.played
+                        preview._loop = DeckLoop(loop.frames, loop_start_frame, loop.start_own,
+                                                 loop.end_own, loop.beats, loop_index)
+                old, self._headphones_deck = self._headphones_deck, preview
+                self._headphones_slot = slot
+        if stale:
+            preview.close()
+            return False
+        if old is not None:
+            old.close()
+        return True
+
+    def attach_headphone_stream(self, buffered_frames: int = 0) -> Optional[queue.Queue[bytes]]:
+        """Attach one local PCM consumer, seeded to the same voice-buffer edge."""
+        with self._lock:
+            if len(self._headphone_streams) >= 2:
+                return None
+            stream: queue.Queue[bytes] = queue.Queue(maxsize=50)
+            count = min(50, max(0, int(buffered_frames)))
+            for frame in list(self._headphone_history)[-count:] if count else ():
+                stream.put_nowait(frame)
+            self._headphone_streams.append(stream)
+            return stream
+
+    def detach_headphone_stream(self, stream: queue.Queue[bytes]) -> None:
+        old = None
+        with self._lock:
+            try:
+                self._headphone_streams.remove(stream)
+            except ValueError:
+                pass
+            # Atomically retire PFL when the final browser leaves. A concurrent
+            # new listener cannot be stranded with its decoder cleared afterward.
+            if not self._headphone_streams:
+                # Also invalidate a preview still warming on the request thread.
+                self._headphones_generation += 1
+                old, self._headphones_deck = self._headphones_deck, None
+                self._headphones_slot = None
+        if old is not None:
+            old.close()
+
+    def read(self) -> bytes:
+        """Render one program frame and publish its independent headphone mix."""
+        retired = None
+        retired_loop = None
+        abandoned_loop_preview = None
+        retired_head_loop = None
+        abandoned_head_loop_preview = None
+        with self._lock:
+            pending = self._pending_loop_exit
+            if pending is not None:
+                old, preview = pending.old, pending.preview
+                head_old, head_preview = pending.head_old, pending.head_preview
+                if self.current is old and old.played >= pending.boundary:
+                    preview._zi = old._zi
+                    preview.grid, preview.slot = old.grid, old.slot
+                    preview.outs, preview.out_lead = old.outs, old.out_lead
+                    self.current = preview
+                    old._loop = None
+                    self._pending_loop_exit = None
+                    retired_loop = old
+                    if head_preview is not None:
+                        if head_old is not None and self._headphones_deck is head_old and self._headphones_slot == old.slot:
+                            head_preview._zi = head_old._zi
+                            head_preview.grid, head_preview.slot = old.grid, old.slot
+                            head_preview.outs, head_preview.out_lead = old.outs, old.out_lead
+                            self._headphones_deck = head_preview
+                            retired_head_loop = head_old
+                        else:
+                            abandoned_head_loop_preview = head_preview
+                    if pending.after_skip:
+                        self._begin_planning("skip")
+                elif self.current is not old:
+                    self._pending_loop_exit = None
+                    abandoned_loop_preview = preview
+                    abandoned_head_loop_preview = head_preview
+            frame = self._read_locked()
+            cue = None
+            if self._headphones_deck is not None:
+                # Keep the selected PFL decoder's source clock aligned with
+                # the program deck even before a browser has attached a PCM
+                # stream. Slip rolls depend on both decoders consuming exactly
+                # one live frame per rendered program frame.
+                deck = self._headphones_deck
+                raw = deck.frame()
+                if raw is None:
+                    retired, self._headphones_deck = deck, None
+                    self._headphones_slot = None
+                elif self._headphone_streams:
+                    slot = self._headphones_slot
+                    if slot in (1, 2):
+                        cue = mix_frames(deck.split(raw), None, SOLO,
+                                         self.controls.channel_pre_fader(slot), IDENTITY, 1.0)
+            phones = headphone_frame(cue, frame, self.controls.phones_mix, self.controls.phones)
+            self._headphone_history.append(phones)
+            for stream in tuple(self._headphone_streams):
+                if stream.full():
+                    try:
+                        stream.get_nowait()
+                    except queue.Empty:
+                        pass
+                try:
+                    stream.put_nowait(phones)
+                except queue.Full:
+                    pass
+        # Reap an EOF preview off the locked render path; close() can join its
+        # decoder pump and must never hold the mixer lock while doing so.
+        if retired is not None:
+            retired.close()
+        if retired_loop is not None:
+            retired_loop.close()
+        if abandoned_loop_preview is not None:
+            abandoned_loop_preview.close()
+        if retired_head_loop is not None:
+            retired_head_loop.close()
+        if abandoned_head_loop_preview is not None:
+            abandoned_head_loop_preview.close()
+        return frame
 
     def _read_locked(self) -> bytes:
         cur = self.current
         if cur is None:
             return b""
+        self.controls.advance_frame()
         plan = self.plan
         # One consistent view per frame: a skip, a load or a cue from the
         # booth calls a plan off from another thread, and a frame that read
@@ -1682,7 +3365,9 @@ class CrossfadeSource(_AudioSource):
             plan = None
         # Early enough to fit a blend before a long outro: the plan places
         # itself on the last phrase that leaves room, however soon it is made.
-        if (plan is None and self.hand is None and not self._planning
+        if (plan is None and self.hand is None and not getattr(cur, "loop_active", False)
+                and not getattr(cur, "roll_active", False)
+                and not getattr(cur, "bend_active", False) and not getattr(cur, "pitch_ramping", False) and not self._planning
                 and cur.remaining <= int(self._plan_ahead(cur) * FRAMES_PER_S)):
             self._begin_planning("end")
         if self.hand is not None and plan is None:
@@ -1698,7 +3383,10 @@ class CrossfadeSource(_AudioSource):
         if self._splice is not None:
             out, cur = self._splice_frame(cur, k, out)
             t0 = cur.at(cur.played - 1)
-        elif (plan is None and self.tempo_glide and not self._gliding and not self._planning
+        elif (plan is None and not getattr(cur, "loop_active", False)
+              and not getattr(cur, "roll_active", False)
+              and not getattr(cur, "bend_active", False) and not getattr(cur, "pitch_control_active", False)
+              and self.tempo_glide and not self._gliding and not self._planning
               and self.frames_sent >= self._glide_next and abs(cur.ratio - 1.0) > 0.0015
               and cur.grid is not None and cur.grid.bar_known
               and cur.remaining > int((self._plan_ahead(cur) + 30) * FRAMES_PER_S)):
@@ -1722,11 +3410,28 @@ class CrossfadeSource(_AudioSource):
         hands = self.controls
         solo = SOLO
         hands_now = (1.0,) * 6
-        if plan is None and self.rides and out is not None and cur.grid is not None:
-            times = t0 + np.arange(FRAME_SAMPLES, dtype=np.float32) / RATE
-            fac, self.gesture = kaia_hands(None, times, self.energy, cur.grid, cur.ratio,
-                                           seed=hash(cur.record.path) & 0xFFFF)
-            hands_now = tuple(round(float(np.asarray(x).reshape(-1)[-1]), 3) for x in fac)
+        if (plan is None and not getattr(cur, "loop_active", False)
+                and not getattr(cur, "bend_active", False)
+                and self.rides and out is not None and cur.grid is not None):
+            times = t0 + np.arange(FRAME_SAMPLES, dtype=np.float32) * getattr(cur, "playback_rate", 1.0) / RATE
+            fac, label, _skill_id, handled = self.skill_scheduler.render_solo(times, cur.slot, cur.ratio)
+            if not handled:
+                # Preserve the old small phrase gesture only when no aligned
+                # structural profile action can speak to this section. A stable
+                # CRC fingerprint survives Python process restarts.
+                fac, label = kaia_hands(
+                    None, times, self.energy, cur.grid, cur.ratio,
+                    seed=self.skill_scheduler.solo_fingerprint & 0xFFFF,
+                )
+                fac = self.skill_scheduler.mask_solo_fallback(fac, times, cur.slot)
+                self.skill_scheduler.report_legacy(
+                    label, float(times[0]), float(times[-1]), fac, cur.grid, cur.ratio,
+                )
+            self.gesture = label
+            rendered_hands = tuple(round(float(np.asarray(x).reshape(-1)[-1]), 3) for x in fac)
+            # Solo skills return only the on-air deck's three EQ lanes; the
+            # dashboard contract always carries both decks' six lane values.
+            hands_now = rendered_hands + (1.0, 1.0, 1.0) if len(rendered_hands) == 3 else rendered_hands
             if any(float(np.abs(x - 1).max()) > 1e-4 for x in fac[:3]):
                 solo = tuple(fac[:3]) + (0.0, 0.0, 0.0)
         if plan is None and hands.flat() and solo is SOLO:
@@ -1741,10 +3446,15 @@ class CrossfadeSource(_AudioSource):
             self.hands_now = hands_now
             self.levels["b"] = -90.0
         else:
-            times = t0 + np.arange(FRAME_SAMPLES, dtype=np.float32) / RATE
+            # A published transition always owns a prepared incoming deck.
+            # Narrow the optional reference for the renderer and type checker.
+            assert incoming is not None
+            times = t0 + np.arange(FRAME_SAMPLES, dtype=np.float32) * getattr(cur, "playback_rate", 1.0) / RATE
             g = gains(plan, times)
             if self.rides:
-                fac, self.gesture = kaia_hands(plan, times, self.energy)
+                fac, self.gesture, _skill_id = self.skill_scheduler.render_blend(
+                    plan, times, cur.slot, incoming.slot
+                )
                 g = tuple(a * b for a, b in zip(g, fac))
                 hands_now = tuple(round(float(np.asarray(x).reshape(-1)[-1]), 3) for x in fac)
             out_parts = cur.split(out) if out is not None else None
@@ -1756,12 +3466,16 @@ class CrossfadeSource(_AudioSource):
             self.applied = tuple(round(float(x[-1]), 3) for x in g)
             self.hands_now = hands_now
             self.levels["b"] = self._db(inc)
-            if out is None or t0 + FRAME_MS / 1000 >= plan.done:
+            if out is None or t0 + FRAME_MS / 1000 * cur.playback_rate >= plan.done:
                 with self._lock:
                     if self.incoming is incoming and self.plan is plan:
                         self._advance()
         if self._echo_tail is not None and frame:
             frame = self._echo_play(frame)
+        # This is the audible, bounded master FX bus. PFL is mixed separately;
+        # the local headphone MASTER leg receives the effected program frame.
+        if frame:
+            frame = self.effects.process(frame)
         self.levels["a"] = self._db(out)
         self.levels["master"] = self._db(frame)
         self.meter.append((self.frames_sent, cur.slot, self.levels["a"], self.levels["b"], self.levels["master"]))
@@ -1780,7 +3494,7 @@ class CrossfadeSource(_AudioSource):
             if keep.any():
                 self._echo_cap.append((sum(out_parts[1:]) * level)[keep])
         if self._echo_cap and float(times[-1]) >= plan.drop and self._echo_tail is None:
-            tail = echo_tail(np.concatenate(self._echo_cap), plan.beat)
+            tail = echo_tail(np.concatenate(self._echo_cap), plan.beat / plan.playback_rate)
             self._echo_cap = []
             first = int(np.searchsorted(times, plan.drop))
             # Index 0 of the tail is the drop: in this frame, `first` samples in.
@@ -1839,7 +3553,7 @@ class CrossfadeSource(_AudioSource):
             time.sleep(0.02)
         with self._lock:
             if (cur is not self.current or self.plan is not None or self.hand is not None or self._planning
-                    or not new.ready() or k_pre <= cur.played + 1):
+                    or cur.bend_active or not new.ready() or k_pre <= cur.played + 1):
                 new.close()
                 return
             new.grid, new.slot = cur.grid, cur.slot
@@ -1921,6 +3635,8 @@ class CrossfadeSource(_AudioSource):
         self.plan, self._start_frame = None, None
         self.cue, self.by_hand = None, False
         self.gesture = ""
+        self.skill_scheduler.cancel_blend()
+        self.skill_scheduler.clear_active()
         if old:
             old.close()
         if self.current and self._on_change:
@@ -1934,10 +3650,20 @@ class CrossfadeSource(_AudioSource):
         """Retire decks only at a frame boundary."""
         with self._lock:
             self._cancel_splice()
-            for deck in (self.current, self.incoming, self.hand):
+            self.skill_scheduler.cancel_blend()
+            self.skill_scheduler.clear_active()
+            self.effects.cancel()
+            pending_loop = self._pending_loop_exit
+            self._pending_loop_exit = None
+            for deck in (self.current, self.incoming, self.hand, self._headphones_deck,
+                         pending_loop.preview if pending_loop is not None else None,
+                         pending_loop.head_preview if pending_loop is not None else None):
                 if deck:
                     deck.close()
             self.current = self.incoming = self.hand = None
+            self._headphones_deck = None
+            self._headphones_slot = None
+            self._headphone_streams.clear()
 
 
 class BufferedRecordsSource(_AudioSource):
@@ -2107,7 +3833,29 @@ class RecordsSession:
         self._closing = False
         self._task: Optional[asyncio.Task] = None
         self._rng = random.Random()
-        self.requests: list[str] = []             # paths asked for at the booth, in order
+        self.requests: list[str] = []             # track paths asked for at the booth, in order
+        # Musical direction is separate from booth track requests and expires
+        # after one successfully prepared autonomous pick or fifteen minutes.
+        from utils.audio import records_intent
+        self._listener_intent_lock = threading.Lock()
+        self._listener_intent: Optional[records_intent.ListenerIntent] = None
+        self._listener_intent_sequence = 0
+        self._listener_pick_generation = 0
+        self._listener_pick_active_generation: Optional[int] = None
+        self._listener_intent_min_pick_generation = 1
+        self._listener_profile_lock = threading.Lock()
+        # Each path entry is paired with the complete source-audio identity.
+        # A live crate replacement must not leave this session steering picks
+        # from the previous file's phrase evidence.
+        self._listener_profile_cache: dict[str, tuple[str, object]] = {}
+        # One bounded worker compiles per-record skill timelines from cached
+        # phrase profiles. A newer deck supersedes any queued older request.
+        self._skill_profile_queue: queue.Queue[tuple[int, library.Record]] = queue.Queue(maxsize=1)
+        self._skill_profile_stop = threading.Event()
+        self._skill_profile_thread: Optional[threading.Thread] = None
+        self._skill_profile_generation = 0
+        self._skill_profile_queue_lock = threading.Lock()
+        self.last_listener_intent: Optional[dict] = None
         # What she says about the set, for the booth (`dj_voice`), newest last.
         self.chatter: deque = deque(maxlen=40)
         self._why: dict = {}                      # path -> (edge, in_set) for the record picked next
@@ -2117,15 +3865,26 @@ class RecordsSession:
         self._by_path = {r.path: r for r in crate}
         self.graph = setlist.load()
         self.set_list: Optional[list] = None
-        if setlist.needs_build(self.graph, crate):
-            pending = setlist.pending(self.graph, crate)
-            sets_only = (
-                self.graph.get("method", 2) >= setlist.METHOD
-                and self.graph.get("sets_method", 1) < setlist.SET_METHOD
-                and pending["records"] == 0
-                and pending["pairs"] == 0
-            )
-            setlist.build_in_background(crate, on_done=self._graph_built, sets_only=sets_only)
+
+        def check_graph():
+            # Audio identity can require hashing each file in the crate. Keep
+            # that disk work off Discord's event loop as well as the audio
+            # callback; the measuring subprocess is already separate.
+            try:
+                if not setlist.needs_build(self.graph, crate):
+                    return
+                pending = setlist.pending(self.graph, crate)
+                sets_only = (
+                    self.graph.get("method", 2) >= setlist.METHOD
+                    and self.graph.get("sets_method", 1) < setlist.SET_METHOD
+                    and pending["records"] == 0
+                    and pending["pairs"] == 0
+                )
+                setlist.build_in_background(crate, on_done=self._graph_built, sets_only=sets_only)
+            except Exception as e:
+                log_warning(f"[records] graph freshness check failed: {e}")
+
+        threading.Thread(target=check_graph, daemon=True, name="kaia-records-graph-check").start()
         self.loading: Optional[str] = None        # the newest record being readied for the free deck
         # Loads are prepared off-thread. A generation token makes a newer
         # booth choice supersede an older preparation that finishes later.
@@ -2144,6 +3903,287 @@ class RecordsSession:
     @property
     def now(self) -> Optional[library.Record]:
         return self.source.current.record if self.source and self.source.current else None
+
+    INTENT_PROFILE_TRIES = 20
+    INTENT_PROFILE_CACHE = 32
+
+    async def request(self, text: str, who: str = ""):
+        """Queue one bounded musical preference for the next autonomous pick.
+
+        Track selections remain in self.requests; this API never mutates the
+        mixer or another music session. The selected candidate and its
+        explanation become visible after the transition planner prepares it.
+        """
+        from utils.audio import records_intent
+        if self._closing or self.now is None:
+            return records_intent.RecordsRequestResult(
+                False, "There isn't an active records deck to steer right now."
+            )
+        with self._listener_intent_lock:
+            self._listener_intent_sequence += 1
+            request_id = self._listener_intent_sequence
+        intent, reason = records_intent.create_request(text, who, request_id)
+        if intent is None:
+            return records_intent.RecordsRequestResult(False, reason)
+
+        src = self.source
+        picking = False
+        queued = False
+        if src is not None:
+            # Commit the intent while holding the planner lock: a picker cannot
+            # start between our busy-state snapshot and the eligibility choice.
+            source_lock = getattr(src, "_lock", None)
+            if source_lock is not None:
+                with source_lock:
+                    picking = bool(src._picking)
+                    queued = bool(
+                        src._queued is not None or src.incoming is not None
+                        or src.plan is not None or src._planning
+                    )
+                    with self._listener_intent_lock:
+                        self._listener_intent = intent
+                        self.last_listener_intent = {
+                            "status": "pending", "label": intent.label,
+                            "requested_by": intent.requested_by, "expires_at": intent.expires_at,
+                        }
+                        defer_current_pick = picking and self._listener_pick_active_generation is None
+                        self._listener_intent_min_pick_generation = (
+                            self._listener_pick_generation + (2 if defer_current_pick else 1)
+                        )
+            else:
+                picking = bool(src._picking)
+                queued = bool(
+                    src._queued is not None or src.incoming is not None
+                    or src.plan is not None or src._planning
+                )
+                with self._listener_intent_lock:
+                    self._listener_intent = intent
+                    self.last_listener_intent = {
+                        "status": "pending", "label": intent.label,
+                        "requested_by": intent.requested_by, "expires_at": intent.expires_at,
+                    }
+                    defer_current_pick = picking and self._listener_pick_active_generation is None
+                    self._listener_intent_min_pick_generation = (
+                        self._listener_pick_generation + (2 if defer_current_pick else 1)
+                    )
+        else:
+            with self._listener_intent_lock:
+                self._listener_intent = intent
+                self.last_listener_intent = {
+                    "status": "pending", "label": intent.label,
+                    "requested_by": intent.requested_by, "expires_at": intent.expires_at,
+                }
+                self._listener_intent_min_pick_generation = self._listener_pick_generation + 1
+        queued = queued or picking
+        reply = (
+            f"Got it — I'll favour {intent.label} in the next records choice, "
+            "where cached phrase evidence is available; it is a preference, not a guarantee."
+        )
+        if queued:
+            reply += " The current next-record choice is already in progress, so this will steer the following choice."
+        log_action(f"[records] listener direction from {who or 'someone'}: {intent.label}")
+        return records_intent.RecordsRequestResult(True, reply, queued_after_current=queued)
+
+    def _current_listener_intent(self):
+        with self._listener_intent_lock:
+            intent = self._listener_intent
+            if intent is not None and time.time() >= intent.expires_at:
+                self._listener_intent = None
+                self.last_listener_intent = {
+                    "status": "expired", "label": intent.label, "requested_by": intent.requested_by,
+                }
+                return None
+            if self._listener_pick_generation < self._listener_intent_min_pick_generation:
+                return None
+            return intent
+
+    def _listener_pick_started(self) -> int:
+        """Mark which worker generation is currently choosing an autonomous pick."""
+        with self._listener_intent_lock:
+            self._listener_pick_generation += 1
+            self._listener_pick_active_generation = self._listener_pick_generation
+            return self._listener_pick_generation
+
+    def _listener_pick_finished(self, generation: int) -> None:
+        with self._listener_intent_lock:
+            if self._listener_pick_active_generation == generation:
+                self._listener_pick_active_generation = None
+
+    def _listener_profile(self, record: library.Record):
+        """Read/build a phrase profile on the picker worker, never the audio callback."""
+        # Identity lookup is cheap on a stable stat tuple and performs the
+        # shared complete-payload digest only when the file changes or its
+        # bounded revalidation interval expires. This method is never called
+        # from the 20 ms renderer.
+        identity = library.audio_signature(record.path)
+        if identity is None:
+            return None
+        with self._listener_profile_lock:
+            cached = self._listener_profile_cache.get(record.path)
+            if cached is not None and cached[0] == identity:
+                return cached[1]
+        try:
+            from utils.audio import songmap
+            profile = songmap.phrase_profile(record.path, record.bpm)
+        except Exception as exc:
+            log_debug(f"[records] no phrase evidence for listener preference on {record.path}: {exc}")
+            return None
+        if profile is None:
+            return None
+        # phrase_profile() refreshes the shared identity after its analysis.
+        # Re-read that validated value so a file changed during construction
+        # cannot be cached under the identity observed before the work began.
+        if library.audio_signature(record.path) != identity:
+            return None
+        with self._listener_profile_lock:
+            self._listener_profile_cache[record.path] = (identity, profile)
+            while len(self._listener_profile_cache) > self.INTENT_PROFILE_CACHE:
+                self._listener_profile_cache.pop(next(iter(self._listener_profile_cache)))
+        return profile
+
+    def _listener_candidate_score(self, deck: Deck, candidate: library.Record,
+                                  edge: Optional[dict], intent=None):
+        from utils.audio import records_intent
+        intent = intent or self._current_listener_intent()
+        if intent is None:
+            return None
+        current_profile = self._listener_profile(deck.record)
+        candidate_profile = self._listener_profile(candidate)
+        if current_profile is None or candidate_profile is None:
+            return None
+        # Phrase-profile coordinates are in each source record's own
+        # seconds, not stretched playback seconds. Use the tracked source BPM
+        # (or catalog fallback), never multiply by the deck's live stretch ratio.
+        current_bpm = (
+            getattr(current_profile, "grid_bpm", None)
+            or (deck.grid.bpm if deck.grid is not None else None)
+            or deck.record.bpm or 120.0
+        )
+        candidate_bpm = (
+            getattr(candidate_profile, "grid_bpm", None)
+            or candidate.bpm or 120.0
+        )
+        return records_intent.score_candidate(
+            intent, current_profile, candidate_profile,
+            current_bpm, candidate_bpm, edge,
+        )
+
+    def start_skill_profile_worker(self, record: library.Record) -> None:
+        """Start the bounded profile worker after playback successfully registers."""
+        if self._skill_profile_thread is not None and self._skill_profile_thread.is_alive():
+            self._queue_skill_profile(record)
+            return
+        self._skill_profile_stop.clear()
+        self._skill_profile_thread = threading.Thread(
+            target=self._run_skill_profile_worker,
+            daemon=True,
+            name=f"kaia-records-skills-{self.guild_id}",
+        )
+        self._skill_profile_thread.start()
+        self._queue_skill_profile(record)
+
+    def _queue_skill_profile(self, record: library.Record) -> None:
+        """Clear stale actions and enqueue a latest-deck-wins profile compilation."""
+        if self._closing or self._skill_profile_stop.is_set():
+            return
+        src = self.source
+        if src is not None:
+            scheduler = getattr(src, "skill_scheduler", None)
+            source_lock = getattr(src, "_lock", None)
+            if scheduler is not None and source_lock is not None:
+                # The callback can run under src._lock (RLock). Clear the
+                # previous track's timeline before this frame can render.
+                with source_lock:
+                    if src.current is not None and src.current.record.path == record.path:
+                        import zlib
+                        fingerprint = zlib.crc32(record.path.encode("utf-8")) & 0xFFFFFFFF
+                        scheduler.set_solo_profile(None, fingerprint)
+        with self._skill_profile_queue_lock:
+            self._skill_profile_generation += 1
+            item = (self._skill_profile_generation, record)
+            try:
+                self._skill_profile_queue.put_nowait(item)
+            except queue.Full:
+                try:
+                    self._skill_profile_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self._skill_profile_queue.put_nowait(item)
+                except queue.Full:
+                    # A racing worker already filled the one slot with a newer
+                    # request; its generation check prevents stale installation.
+                    return
+
+    def _run_skill_profile_worker(self) -> None:
+        """Build and compile profile actions away from the PCM renderer."""
+        import zlib
+        while not self._skill_profile_stop.is_set():
+            try:
+                generation, record = self._skill_profile_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            profile = self._listener_profile(record)
+            if self._skill_profile_stop.is_set() or self._closing:
+                continue
+            src = self.source
+            if src is None:
+                continue
+            scheduler = getattr(src, "skill_scheduler", None)
+            source_lock = getattr(src, "_lock", None)
+            if scheduler is None or source_lock is None:
+                continue
+            fingerprint = zlib.crc32(record.path.encode("utf-8")) & 0xFFFFFFFF
+            with source_lock:
+                with self._skill_profile_queue_lock:
+                    current_generation = generation == self._skill_profile_generation
+                if (not current_generation or self._closing or src.current is None
+                        or src.current.record.path != record.path):
+                    continue
+                try:
+                    scheduler.set_solo_profile(profile, fingerprint)
+                    if profile is not None:
+                        action_count = scheduler.snapshot()["solo_actions"]
+                        log_debug(f"[records] compiled {action_count} phrase-skill actions for {record.name}")
+                    else:
+                        log_debug(f"[records] phrase profile unavailable for {record.name}; legacy fallback remains")
+                except Exception as exc:
+                    log_warning(f"[records] phrase-skill compilation failed for {record.name}: {exc}")
+                    scheduler.set_solo_profile(None, fingerprint)
+
+    def stop_skill_profile_worker(self) -> None:
+        stop_event = getattr(self, "_skill_profile_stop", None)
+        if stop_event is not None:
+            stop_event.set()
+        thread = getattr(self, "_skill_profile_thread", None)
+        if thread is not None and thread.is_alive() and threading.current_thread() is not thread:
+            thread.join(timeout=0.25)
+        if hasattr(self, "_skill_profile_thread"):
+            self._skill_profile_thread = None
+
+    def _listener_intent_selected(self, nxt: Next) -> None:
+        """Consume the matching one-shot request only after a prepared plan exists."""
+        request_id = nxt.listener_intent_id
+        if request_id is None:
+            return
+        with self._listener_intent_lock:
+            intent = self._listener_intent
+            if intent is None or intent.request_id != request_id:
+                return
+            self._listener_intent = None
+            self._listener_intent_min_pick_generation = 0
+            self.last_listener_intent = {
+                "status": "selected", "label": intent.label,
+                "requested_by": intent.requested_by,
+                "record": nxt.record.name,
+                "score": nxt.listener_intent_score,
+                "reason": nxt.listener_intent_reason,
+                "selected_at": time.time(),
+            }
+        log_action(
+            f"[records] selected {nxt.record.name} for {intent.label} listener preference "
+            f"(score {nxt.listener_intent_score})"
+        )
 
     #: How many fitting records are looked at for one that will blend with the
     #: record on air, before settling for one that can only be switched to.
@@ -2215,6 +4255,13 @@ class RecordsSession:
         threading.Thread(target=run, daemon=True, name="kaia-records-load").start()
 
     def _choose(self, deck: Deck) -> Optional[Next]:
+        generation = self._listener_pick_started()
+        try:
+            return self._choose_impl(deck)
+        finally:
+            self._listener_pick_finished(generation)
+
+    def _choose_impl(self, deck: Deck) -> Optional[Next]:
         from utils.audio import beatgrid
         _envelope(deck.record.path)                    # the record on air, measured against at plan time
         while self.requests:
@@ -2331,10 +4378,8 @@ class RecordsSession:
         return self._by_path[first].name, False
 
     def _partner(self, deck: Deck) -> Optional[Next]:
-        """The next record from the measured graph (`setlist`): the next one in
-        the set being played if it is a measured lock from this one, else the
-        partner that sits best in key and has the most partners of its own."""
-        from utils.audio import beatgrid, setlist
+        """Pick a measured partner, optionally steering it with one listener intent."""
+        from utils.audio import beatgrid, records_intent, setlist
         try:
             nbrs = setlist.partners(self.graph, deck.record.path)
         except Exception:
@@ -2345,20 +4390,58 @@ class RecordsSession:
                    and not any(library.same_song(self._by_path[p], h) for h in heard)]
         if not options:
             return None
-        if self.set_list and deck.record.path in self.set_list:
-            i = self.set_list.index(deck.record.path)
-            ahead = [p for p in self.set_list[i + 1:] if p not in played]
-            if ahead and ahead[0] in options:
-                options = [ahead[0]]
-        else:
-            self.set_list = next((s for s in self.graph.get("sets", []) if deck.record.path in s), self.set_list)
+
+        if self.set_list and deck.record.path not in self.set_list:
+            self.set_list = next(
+                (s for s in self.graph.get("sets", []) if deck.record.path in s), None
+            )
         onward = lambda p: len([x for x in setlist.partners(self.graph, p) if x not in played])
         start_record = self._by_path.get(self.set_list[0]) if self.set_list else deck.record
         start_family = setlist.family(start_record or deck.record)
-        options.sort(key=lambda p: setlist.transition_rank(
+        ranked = sorted(options, key=lambda p: setlist.transition_rank(
             deck.record, self._by_path[p], nbrs.get(p),
             history=heard, start_family=start_family, onward=onward(p), rng=self._rng,
         ))
+
+        intent = self._current_listener_intent()
+        intent_scores: dict[str, tuple[float, str]] = {}
+        if intent is not None:
+            # Profile at most a bounded frontier; the profile cache is populated
+            # by the graph builder where possible. Any cache miss stays on this
+            # picker worker, never the 20 ms audio renderer.
+            for path in ranked[:self.INTENT_PROFILE_TRIES]:
+                scored = self._listener_candidate_score(
+                    deck, self._by_path[path], nbrs.get(path), intent
+                )
+                if scored is not None:
+                    intent_scores[path] = scored
+
+        # Preserve the precomputed set path by default. A listener preference
+        # may move a candidate ahead of it only when the profile evidence moves
+        # in the requested direction by a meaningful amount.
+        default_options = ranked
+        if self.set_list and deck.record.path in self.set_list:
+            i = self.set_list.index(deck.record.path)
+            ahead = [p for p in self.set_list[i + 1:] if p not in played]
+            if ahead and ahead[0] in ranked:
+                default_options = [ahead[0]]
+        preferred = {
+            path: value for path, value in intent_scores.items()
+            if value[0] >= records_intent.MIN_PREFERENCE_SCORE
+        } if intent is not None else {}
+        if preferred:
+            preferred_paths = sorted(
+                preferred, key=lambda path: (-preferred[path][0], ranked.index(path))
+            )
+            options = preferred_paths + [
+                path for path in default_options if path not in preferred_paths
+            ] + [
+                path for path in ranked
+                if path not in preferred_paths and path not in default_options
+            ]
+        else:
+            options = default_options
+
         for path in options[:4]:
             rec = self._by_path[path]
             seconds = probe_seconds(rec.path)
@@ -2373,9 +4456,17 @@ class RecordsSession:
                                              bool(self.set_list and path in self.set_list)), "pick")
             except Exception as e:
                 log_debug(f"[records] chatter: {e}")
-            return Next(rec, seconds, gain_db(rec.path), beatgrid.grid_for(rec.path, rec.bpm),
-                        beatgrid.first_sound(rec.path), beatgrid.bass_entry(rec.path, rec.bpm),
-                        source="set" if self.set_list and path in self.set_list else "partner")
+            nxt = Next(rec, seconds, gain_db(rec.path), beatgrid.grid_for(rec.path, rec.bpm),
+                       beatgrid.first_sound(rec.path), beatgrid.bass_entry(rec.path, rec.bpm),
+                       source="set" if self.set_list and path in self.set_list else "partner")
+            if path in preferred and intent is not None:
+                nxt.listener_intent_id = intent.request_id
+                nxt.listener_intent_score, nxt.listener_intent_reason = preferred[path]
+                if self.set_list and path not in self.set_list:
+                    self.set_list = next(
+                        (s for s in self.graph.get("sets", []) if path in s), None
+                    )
+            return nxt
         return None
 
     #: Records measured against the one on air when the graph has nothing for
@@ -2385,11 +4476,8 @@ class RecordsSession:
     SEARCH_BUDGET_S = 40.0
 
     def _candidates(self, deck: Deck, exclude: Optional[library.Record] = None) -> list:
-        """Records that could follow `deck`, best first: its measured partners,
-        then anything within stretch of the tempo playing, by key and genre —
-        each not played (nor another file of a song played), and those with
-        measured partners of their own ahead of those without."""
-        from utils.audio import beatgrid, setlist
+        """Candidates for a fresh measured pick, with bounded intent preference."""
+        from utils.audio import beatgrid, records_intent, setlist
         played = set(self.played)
         heard = [self._by_path[p] for p in played if p in self._by_path] + [deck.record]
         playing = (deck.grid.bpm * deck.ratio) if deck.grid else ((deck.record.bpm or 0) * deck.ratio or None)
@@ -2407,21 +4495,50 @@ class RecordsSession:
             start_family=start_family, onward=onward(r), rng=self._rng,
         ))
         rest = [r for r in self.crate if fresh(r) and r not in first and library.tempo_ratio(playing, r.bpm)
-                and beatgrid.ticks_for(r.path) is not None]
+                and beatgrid.ticks_available(r.path, r.bpm)]
         rest.sort(key=lambda r: (onward(r) == 0, -library.score(deck.record, r), self._rng.random()))
-        return first + rest
+        ranked = first + rest
+
+        intent = self._current_listener_intent()
+        if intent is None:
+            return ranked
+        scored: dict[str, tuple[float, str]] = {}
+        for rec in ranked[:self.INTENT_PROFILE_TRIES]:
+            value = self._listener_candidate_score(
+                deck, rec, nbrs.get(rec.path), intent
+            )
+            if value is not None:
+                scored[rec.path] = value
+        preferred = {
+            path: value for path, value in scored.items()
+            if value[0] >= records_intent.MIN_PREFERENCE_SCORE
+        }
+        if not preferred:
+            return ranked
+        position = {rec.path: i for i, rec in enumerate(ranked)}
+        preferred_records = sorted(
+            (rec for rec in ranked if rec.path in preferred),
+            key=lambda rec: (-preferred[rec.path][0], position[rec.path]),
+        )
+        preferred_paths = {rec.path for rec in preferred_records}
+        return preferred_records + [rec for rec in ranked if rec.path not in preferred_paths]
 
     def _alternatives(self, deck: Deck, rejected: Next):
-        """Readied records to try when `rejected` will not lock with `deck`."""
-        nbrs = None
+        """Readied records to try when her pick will not lock with the outgoing."""
+        from utils.audio import setlist
+        intent = self._current_listener_intent()
+        nbrs = setlist.partners(self.graph, deck.record.path)
         for rec in self._candidates(deck, exclude=rejected.record)[:self.SEARCH_TRIES]:
             nxt = self._prepare(rec)
             if nxt is None:
                 continue
-            if nbrs is None:
-                from utils.audio import setlist
-                nbrs = setlist.partners(self.graph, deck.record.path)
             nxt.source = "partner" if rec.path in nbrs else "search"
+            if intent is not None:
+                scored = self._listener_candidate_score(deck, rec, nbrs.get(rec.path), intent)
+                from utils.audio import records_intent
+                if scored is not None and scored[0] >= records_intent.MIN_PREFERENCE_SCORE:
+                    nxt.listener_intent_id = intent.request_id
+                    nxt.listener_intent_score, nxt.listener_intent_reason = scored
             yield nxt
 
     def _measured_pick(self, deck: Deck) -> Optional[Next]:
@@ -2473,6 +4590,7 @@ class RecordsSession:
         except Exception as e:
             log_debug(f"[records] chatter: {e}")
         log_action(f"[records] now playing {record.name} ({record.bpm or '?'} bpm, {record.key or '?'})")
+        self._queue_skill_profile(record)
 
     def _humans(self) -> list[str]:
         return [m.display_name for m in getattr(self.vc.channel, "members", []) if not m.bot]
@@ -2549,6 +4667,7 @@ class RecordsSession:
                 self.vc.stop()
         except Exception as e:
             log_debug(f"[records] stop playback: {e}")
+        await asyncio.to_thread(self.stop_skill_profile_worker)
         if self.voice_source:
             self.voice_source.cleanup()
         if self.source:
@@ -2607,9 +4726,26 @@ class RecordsSession:
         q = self.source._queued if self.source else None
         nxt = q.record.name if q else (self.source.incoming.record.name if self.source and self.source.incoming else None)
         now = self.now
+        intent = self._current_listener_intent()
+        if intent is None:
+            # A pending request deferred behind the current pick is still
+            # visible in the booth even though that in-flight worker cannot use it.
+            with self._listener_intent_lock:
+                intent = self._listener_intent
+        listener_intent = None
+        if intent is not None:
+            from utils.audio import records_intent
+            listener_intent = records_intent.pending_label(intent)
+        elif self.last_listener_intent:
+            last = self.last_listener_intent
+            if last.get("status") == "selected":
+                listener_intent = f"{last.get('label')} preference selected {last.get('record')}"
+            elif last.get("status") == "expired":
+                listener_intent = f"{last.get('label')} request expired unused"
         return {"now": now.name if now else None, "bpm": now.bpm if now else None,
                 "key": now.key if now else None, "genre": now.genre if now else None,
                 "next": nxt, "played": len(self.names), "channel": self.channel_name,
+                "listener_intent": listener_intent,
                 "uptime_min": round((time.time() - self.started_at) / 60), "listeners": len(self._humans())}
 
 
@@ -2689,6 +4825,7 @@ async def _start_records(channel, crate: list[library.Record], first: library.Re
                                          mix_beats=int(mix_beats))
         session.source.say = session.say
         session.source.alternatives = session._alternatives
+        session.source._on_picked = session._listener_intent_selected
         try:
             from utils.infrastructure.system.yaml_config import config
             session.source.rides = bool(config.get("music.records_kaia_hands", True))
@@ -2696,6 +4833,10 @@ async def _start_records(channel, crate: list[library.Record], first: library.Re
             session.source.tempo_glide = bool(config.get("music.records_tempo_glide", True))
         except Exception as e:
             log_debug(f"[records] records_kaia_hands not read: {e}")
+        scheduler = getattr(session.source, "skill_scheduler", None)
+        if scheduler is not None:
+            scheduler.set_enabled(session.source.rides)
+        session._queue_skill_profile(first)  # clear timeline and seed fallback before first PCM frame
         # The first record's decoder has to be ahead before the voice thread
         # starts asking: a set started while it was still spinning up (rubberband,
         # a busy machine) opened on frames of silence.
@@ -2738,6 +4879,7 @@ async def _start_records(channel, crate: list[library.Record], first: library.Re
             log_debug(f"[records] startup voice disconnect failed: {cleanup_exc}")
         raise
     _sessions[guild.id] = session
+    session.start_skill_profile_worker(first)
     try:
         from utils.audio import dj_dashboard
         await asyncio.to_thread(dj_dashboard.serve)

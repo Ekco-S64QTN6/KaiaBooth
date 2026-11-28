@@ -2,7 +2,9 @@
 import io
 import json
 import random
+import threading
 import time
+import types
 
 import numpy as np
 import pytest
@@ -10,7 +12,7 @@ import pytest
 from utils.audio import library
 from utils.audio import records as R
 from utils.audio.beatgrid import Grid
-from utils.audio.records import FRAME_BYTES, FRAMES_PER_S, RATE, CrossfadeSource, Deck, Next, plan_transition, gains
+from utils.audio.records import FRAME_BYTES, FRAME_SAMPLES, FRAMES_PER_S, RATE, CrossfadeSource, Deck, Next, plan_transition, gains
 
 
 @pytest.fixture(autouse=True)
@@ -118,6 +120,381 @@ LOOSE = Grid(bpm=120.0, downbeat=0.0, contrast=2.7)            # rock, breaks: B
 
 def nxt(grid=STEADY, seconds=300.0, name="two"):
     return Next(rec(name, 120, "8A"), seconds, 0.0, grid)
+
+@pytest.fixture
+def loop_source():
+    frame_count = 1500
+    frame_values = (np.arange(frame_count, dtype=np.int16) % 20000) + 1000
+    samples = np.repeat(frame_values, FRAME_SAMPLES * 2)
+    data = samples.tobytes()
+
+    def factory(path, ratio, gain=0.0, offset=0.0, semitones=0):
+        start = int(round(offset / ratio * FRAMES_PER_S))
+        return io.BytesIO(data[start * FRAME_BYTES:])
+
+    first = Deck(rec("loop-pattern", 120, "8A"), 1.0, 300.0, factory)
+    first.grid = STEADY
+    src = CrossfadeSource(first, lambda _deck: None, stream_factory=factory,
+                          grid_at=lambda *_args: STEADY)
+    src.rides = False
+    wait_for(first, 150)
+    yield src
+    src.cleanup()
+
+
+def test_loop_repeats_exact_predecoded_pcm_and_wraps_only_the_source_clock(loop_source):
+    src = loop_source
+    deck = src.current
+    assert deck is not None
+    assert src.set_loop(1, 2)
+    loop = deck._loop
+    assert loop is not None and loop.beats == 2 and len(loop.frames) == 50
+    start_frame = loop.start_played
+    assert deck.at(start_frame) == pytest.approx(4.0)
+    assert deck.at(start_frame + 50) == pytest.approx(4.0)
+    assert deck.remaining == int(round((deck.end - 5.0) * FRAMES_PER_S))
+
+    while deck.played < start_frame:
+        src.read()
+    first_cycle = [src.read() for _ in range(50)]
+    assert deck.played == start_frame + 50
+    assert deck.at() == pytest.approx(4.0)
+    second_cycle = [src.read() for _ in range(50)]
+    assert first_cycle == second_cycle
+    assert deck.played == start_frame + 100
+    assert deck.at() == pytest.approx(4.0)
+    assert src.plan is None
+
+
+def test_pfl_monitor_follows_loop_pcm_and_exits_with_the_program_deck(loop_source):
+    src = loop_source
+    assert src.current is not None
+    src.controls.set(None, "phones", 1.0)
+    src.controls.set(None, "phones_mix", 0.0)
+    assert src.set_headphones(1)
+    stream = src.attach_headphone_stream()
+    assert stream is not None
+    head_old = src._headphones_deck
+    try:
+        assert src.set_loop(1, 2)
+        loop = src.current._loop
+        assert loop is not None
+        while src.current.played < loop.start_played:
+            src.read()
+            stream.get_nowait()
+        program_cycle = []
+        monitor_cycle = []
+        for _ in range(len(loop.frames)):
+            program_cycle.append(src.read())
+            monitor_cycle.append(stream.get_nowait())
+        assert all(np.allclose(np.frombuffer(a, np.int16), np.frombuffer(b, np.int16), atol=1)
+                       for a, b in zip(program_cycle, monitor_cycle))
+        old_program = src.current
+        assert src.set_loop(1, None)
+        for _ in range(len(loop.frames) + 3):
+            if src.current is not old_program:
+                break
+            src.read()
+            stream.get_nowait()
+        assert src.current is not old_program
+        assert src._headphones_deck is not None and src._headphones_deck is not head_old
+        assert src._headphones_deck.at(0) == pytest.approx(5.0)
+        next_program = src.read()
+        next_monitor = stream.get_nowait()
+        assert np.allclose(np.frombuffer(next_program, np.int16),
+                           np.frombuffer(next_monitor, np.int16), atol=1)
+    finally:
+        src.detach_headphone_stream(stream)
+        src.set_headphones(None)
+
+def test_selecting_headphones_mid_loop_joins_the_current_loop_cursor(loop_source):
+    src = loop_source
+    assert src.current is not None and src.set_loop(1, 2)
+    loop = src.current._loop
+    assert loop is not None
+    while src.current.played < loop.start_played + 7:
+        src.read()
+    expected_position = src.current.at()
+    expected_index = (src.current.played - loop.start_played) % len(loop.frames)
+    src.controls.set(None, "phones", 1.0)
+    src.controls.set(None, "phones_mix", 0.0)
+    assert src.set_headphones(1)
+    head = src._headphones_deck
+    assert head is not None and head._loop is not None
+    assert head._loop.start_index == expected_index
+    assert head.at() == pytest.approx(expected_position)
+    stream = src.attach_headphone_stream()
+    assert stream is not None
+    try:
+        program = src.read()
+        monitor = stream.get_nowait()
+        assert np.allclose(np.frombuffer(program, np.int16),
+                           np.frombuffer(monitor, np.int16), atol=1)
+    finally:
+        src.detach_headphone_stream(stream)
+        src.set_headphones(None)
+
+def test_exiting_an_armed_loop_clears_the_matching_pfl_loop_too(loop_source):
+    src = loop_source
+    src.controls.set(None, "phones", 1.0)
+    src.controls.set(None, "phones_mix", 0.0)
+    assert src.set_headphones(1)
+    stream = src.attach_headphone_stream()
+    assert stream is not None
+    deck = src.current
+    head = src._headphones_deck
+    assert deck is not None and head is not None
+    try:
+        assert src.set_loop(1, 2)
+        loop = deck._loop
+        assert loop is not None and head._loop is not None
+        assert deck.played < loop.start_played
+        assert src.set_loop(1, None)
+        assert deck._loop is None and head._loop is None
+        assert src._pending_loop_exit is None
+    finally:
+        src.detach_headphone_stream(stream)
+        src.set_headphones(None)
+
+
+def test_headphone_selection_is_refused_during_a_pending_loop_exit(loop_source):
+    src = loop_source
+    deck = src.current
+    assert deck is not None and src.set_loop(1, 2)
+    loop = deck._loop
+    assert loop is not None
+    while deck.played < loop.start_played:
+        src.read()
+    assert src.set_loop(1, None)
+    pending = src._pending_loop_exit
+    assert pending is not None
+    assert not src.set_headphones(1)
+    assert src._pending_loop_exit is pending and src.current is deck
+
+def test_loop_exit_warms_after_the_loop_and_switches_only_at_a_wrap(loop_source):
+    src = loop_source
+    old = src.current
+    assert old is not None and src.set_loop(1, 2)
+    loop = old._loop
+    assert loop is not None
+    while old.played < loop.start_played + 1:
+        src.read()
+    assert old.at() == pytest.approx(4.02)
+    assert src.set_loop(1, None)
+    pending = src._pending_loop_exit
+    assert pending is not None and pending.old is old
+    boundary = pending.boundary
+    assert boundary == loop.start_played + len(loop.frames)
+    while src.current is old:
+        src.read()
+    current = src.current
+    assert current is not None and current is not old
+    assert current._loop is None
+    assert current.at(0) == pytest.approx(5.0)
+    assert current.played == 1
+    assert old._closed
+
+
+def test_hot_cue_recall_cannot_interrupt_an_active_or_exiting_loop(loop_source):
+    src = loop_source
+    deck = src.current
+    assert deck is not None and src.set_loop(1, 2)
+    loop = deck._loop
+    assert loop is not None
+    while deck.played < loop.start_played:
+        src.read()
+    assert not src.jump_to_cue(1, 8.0, expected_path=deck.record.path)
+    assert src.current is deck and deck._loop is loop
+    assert src.set_loop(1, None)
+    pending = src._pending_loop_exit
+    assert pending is not None
+    assert not src.jump_to_cue(1, 12.0, expected_path=deck.record.path)
+    assert src.current is deck and src._pending_loop_exit is pending
+
+def test_loop_is_rejected_without_a_counted_grid_or_during_a_transition(loop_source):
+    src = loop_source
+    deck = src.current
+    assert deck is not None
+    deck.grid = Grid(bpm=120.0, downbeat=0.0, contrast=8.0, bar_known=False)
+    assert not src.set_loop(1, 2)
+    deck.grid = STEADY
+    src._planning = True
+    assert not src.set_loop(1, 2)
+    src._planning = False
+    src._pending_planning_mode = "skip"
+    assert not src.set_loop(1, 2)
+    src._pending_planning_mode = None
+    plan = types.SimpleNamespace(kind="out", mode="end")
+    src.plan = plan
+    assert not src.set_loop(1, 2)
+    assert deck._loop is None and src.plan is plan
+
+
+def test_loop_arming_rechecks_transition_planning_after_pcm_preparation(loop_source):
+    src = loop_source
+    original_factory = src._factory
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_factory(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=3.0)
+        return original_factory(*args, **kwargs)
+
+    src._factory = blocking_factory
+    result = []
+    worker = threading.Thread(target=lambda: result.append(src.set_loop(1, 2)), daemon=True)
+    worker.start()
+    assert entered.wait(timeout=1.0)
+    with src._lock:
+        src._planning = True
+    release.set()
+    worker.join(timeout=5.0)
+    with src._lock:
+        src._planning = False
+    assert not worker.is_alive()
+    assert result == [False]
+    assert src.current is not None and src.current._loop is None
+
+def test_loop_arming_rechecks_pitch_ownership_after_pcm_preparation(loop_source):
+    src = loop_source
+    deck = src.current
+    assert deck is not None and src.set_headphones(1)
+    head = src._headphones_deck
+    assert head is not None
+
+    original_factory = src._factory
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_factory(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=3.0)
+        return original_factory(*args, **kwargs)
+
+    src._factory = blocking_factory
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(src.set_loop(1, 2)), daemon=True
+    )
+    worker.start()
+    try:
+        assert entered.wait(timeout=1.0)
+        # The initial transport check has passed; a pitch-fader update races
+        # the off-lock PCM preparation before the loop is committed.
+        assert src.set_pitch(1, 1.05)
+    finally:
+        release.set()
+        worker.join(timeout=5.0)
+
+    assert not worker.is_alive()
+    assert result == [False]
+    assert deck.pitch_control_active and head.pitch_control_active
+    assert not deck.loop_active and not head.loop_active
+
+
+def test_loop_lengths_are_strictly_bounded(loop_source):
+    src = loop_source
+    assert not src.set_loop(1, True)
+    assert not src.set_loop(1, 16)
+    assert not src.set_loop(True, 2)
+    assert src.current._loop is None
+
+@pytest.fixture
+def hotcue_source():
+    def factory(path, ratio, gain=0.0, offset=0.0, semitones=0):
+        return tone(1000, 20.0)(path, ratio, gain=gain, offset=offset)
+
+    first = Deck(rec("hotcue-current", 120, "8A"), 1.05, 300.0, factory,
+                 gain=1.5, semitones=1)
+    first.grid = STEADY
+    src = CrossfadeSource(first, lambda _deck: None, stream_factory=factory,
+                          grid_at=lambda *_args: STEADY)
+    src._fine = lambda _deck, _plan: None
+    wait_for(first, 50)
+    yield src
+    src.cleanup()
+
+
+def test_hot_cue_rebuilds_the_active_deck_at_exact_source_time(hotcue_source):
+    src = hotcue_source
+    old = src.current
+    for _ in range(4):
+        src.read()
+    old_played = old.played
+    assert src.jump_to_cue(1, 5.25, expected_path=old.record.path)
+    replacement = src.current
+    assert replacement is not old
+    assert replacement.slot == 1
+    assert replacement.ratio == pytest.approx(1.05)
+    assert replacement.semitones == 1
+    assert replacement.grid == STEADY
+    assert replacement.at() * replacement.ratio == pytest.approx(5.25, abs=0.02)
+    assert old.played == old_played
+    assert len(replacement._frames) >= 5
+
+
+
+
+def test_hot_cue_preserves_persistent_pitch_and_rebuilds_selected_pfl_decoder(hotcue_source):
+    src = hotcue_source
+    assert src.set_headphones(1)
+    assert src.set_pitch(1, 1.05)
+    for _ in range(R.PITCH_BEND_RAMP_FRAMES + 1):
+        src.read()
+    old = src.current
+    assert old is not None and old.pitch_rate == pytest.approx(1.05)
+    assert src._headphones_deck is not None
+    assert src._headphones_deck.pitch_rate == pytest.approx(1.05)
+
+    assert src.jump_to_cue(1, 5.25, expected_path=old.record.path)
+    replacement = src.current
+    preview = src._headphones_deck
+    assert replacement is not old
+    assert replacement is not None and replacement.pitch_rate == pytest.approx(1.05)
+    assert replacement.at() * replacement.ratio == pytest.approx(5.25, abs=0.02)
+    assert preview is not None and preview.pitch_rate == pytest.approx(1.05)
+    assert preview.at() == pytest.approx(replacement.at(), abs=1 / R.FRAMES_PER_S)
+
+
+def test_hot_cue_refuses_an_active_transition_without_mutating_it(hotcue_source):
+    src = hotcue_source
+    original = src.current
+    plan = types.SimpleNamespace(kind="out", mode="end")
+    src.plan = plan
+    assert src.blend_started()
+    assert not src.jump_to_cue(1, 8.0)
+    assert src.current is original and src.plan is plan
+
+
+def test_hot_cue_identity_guard_rejects_a_replaced_deck(hotcue_source):
+    src = hotcue_source
+    original = src.current
+    assert not src.jump_to_cue(1, 8.0, expected_path="/music/other-track.mp3")
+    assert src.current is original
+
+
+def test_hot_cue_can_set_the_loaded_free_decks_next_play_position(hotcue_source):
+    src = hotcue_source
+    queued = nxt(seconds=120.0, name="queued-hotcue")
+    src._queued = queued
+    assert src.jump_to_cue(2, 37.5, expected_path=queued.record.path)
+    assert src.cue == pytest.approx(37.5)
+    assert src.by_hand
+
+
+def test_hot_cue_does_not_cancel_a_transition_for_the_incoming_deck(hotcue_source):
+    src = hotcue_source
+    original = src.current
+    incoming = Deck(rec("incoming-hotcue", 120, "8A"), 1.0, 120.0, tone(-1000, 20.0))
+    incoming.slot = 2
+    src.incoming = incoming
+    plan = types.SimpleNamespace(kind="blend", mode="skip")
+    src.plan = plan
+    assert not src.jump_to_cue(2, 12.0)
+    assert src.current is original and src.incoming is incoming and src.plan is plan
+    src.incoming = None
+    incoming.close()
 
 
 def test_a_blend_drops_the_incoming_downbeat_on_an_outgoing_bar():
@@ -432,6 +809,10 @@ def test_the_next_record_is_one_with_a_steady_opening_where_one_fits(monkeypatch
     crate = [rec("now", 120, "8A"), rec("loose", 120, "8A"), rec("steady", 120, "8A")]
     session = R.RecordsSession.__new__(R.RecordsSession)
     session.crate, session.played, session._rng, session.requests = crate, [crate[0].path], random.Random(1), []
+    session._listener_intent_lock = threading.Lock()
+    session._listener_intent = None
+    session._listener_pick_generation = 0
+    session._listener_intent_min_pick_generation = 1
     monkeypatch.setattr(R, "probe_seconds", lambda path: 200.0)
     monkeypatch.setattr(R, "gain_db", lambda path: 0.0)
     monkeypatch.setattr(beatgrid, "grid_for", lambda path, bpm: STEADY if "steady" in path else LOOSE)
@@ -512,6 +893,82 @@ def test_a_deck_started_part_way_keeps_its_clock():
     assert d.at(0) == pytest.approx(8.0)                           # 10 s of record at 1.25x
     assert d.end == pytest.approx(80.0, abs=0.02)
 
+
+
+def test_pfl_channel_gain_keeps_eq_and_trim_but_bypasses_fader_and_crossfader():
+    controls = R.Controls()
+    assert controls.set(1, "trim", 6.0)
+    assert controls.set(1, "low", 0.5)
+    assert controls.set(1, "fader", 0.0)
+    assert controls.set(None, "xfader", 1.0)
+    low, mid, high, gain = controls.channel_pre_fader(1)
+    assert low == pytest.approx(0.5) and mid == high == pytest.approx(1.0)
+    assert gain == pytest.approx(10 ** (6.0 / 20))
+    assert controls.channel(1)[3] == 0.0  # the program channel is still silent
+
+
+def test_headphone_bus_blends_cue_and_post_master_at_equal_power():
+    cue = np.full((R.FRAME_SAMPLES, 2), 2000, dtype=np.int16).tobytes()
+    master = np.full((R.FRAME_SAMPLES, 2), 4000, dtype=np.int16).tobytes()
+
+    def peak(frame):
+        return int(np.abs(np.frombuffer(frame, dtype=np.int16)).max())
+
+    assert peak(R.headphone_frame(cue, master, 0.0, 1.0)) == 2000
+    assert peak(R.headphone_frame(cue, master, 1.0, 1.0)) == 4000
+    midpoint = peak(R.headphone_frame(cue, master, 0.5, 1.0))
+    assert midpoint == pytest.approx(round((2000 + 4000) / np.sqrt(2)), abs=1)
+    assert peak(R.headphone_frame(cue, master, 0.5, 0.5)) == pytest.approx(round(midpoint / 2), abs=1)
+    assert peak(R.headphone_frame(None, master, 0.0, 1.0)) == 4000
+
+
+@pytest.fixture
+def headphone_source():
+    first = Deck(rec("monitor", 120, "8A"), 1.0, 300.0, tone(1000, 20.0))
+    first.grid = STEADY
+    src = CrossfadeSource(first, lambda _deck: None, stream_factory=tone(-1000, 20.0),
+                          grid_at=lambda *_args: STEADY)
+    src._fine = lambda _deck, _plan: None
+    wait_for(first, 50)
+    yield src
+    src.cleanup()
+
+
+def test_pfl_uses_a_separate_decoder_without_advancing_the_program_deck(headphone_source):
+    src = headphone_source
+    assert src.set_headphones(1)
+    stream = src.attach_headphone_stream()
+    assert stream is not None
+    try:
+        src.controls.set(1, "fader", 0.0)
+        src.controls.set(None, "xfader", 1.0)
+        before = src.current.played
+        program = src.read()
+        preview = src._headphones_deck
+        monitor = stream.get_nowait()
+        assert src.current.played == before + 1
+        assert preview is not None and preview.played == 1
+        assert np.count_nonzero(np.frombuffer(program, dtype=np.int16)) == 0
+        assert np.max(np.abs(np.frombuffer(monitor, dtype=np.int16))) > 0
+    finally:
+        src.detach_headphone_stream(stream)
+        assert src.set_headphones(None)
+
+
+def test_headphone_stream_queues_are_bounded_and_drop_oldest(headphone_source):
+    src = headphone_source
+    stream = src.attach_headphone_stream()
+    second = src.attach_headphone_stream()
+    assert stream is not None and second is not None
+    assert src.attach_headphone_stream() is None
+    try:
+        for _ in range(60):
+            src.read()
+        assert stream.qsize() == 50 and second.qsize() == 50
+        assert stream.get_nowait() == list(src._headphone_history)[-50]
+    finally:
+        src.detach_headphone_stream(stream)
+        src.detach_headphone_stream(second)
 
 
 def test_a_blend_comes_in_from_the_top_and_hands_the_vocals_over_at_the_swap():
@@ -906,11 +1363,14 @@ def sine(freq: float, amp: float, seconds: float):
 
 
 def test_an_unlocked_transition_echoes_out_under_the_next_record():
-    """No common beat anywhere: not a bare cut — the outgoing stops on its bar
-    and its last beat repeats, quieter each beat, under the incoming."""
+    """A failed blend verification falls back without losing an active pitch rate."""
     from utils.audio import mixcheck
     unlocked = lambda *a: (mixcheck.Verdict(False, 16, 3, why="no common beat"), 0.0)
     first = Deck(rec("one", 120, "8A"), 1.0, 20.0, sine(3000, 8000, 20.0))
+    assert first.set_pitch(1.04)
+    for _ in range(R.PITCH_BEND_RAMP_FRAMES):
+        assert first.frame()  # settle the rate before the planner takes ownership
+    assert first.pitch_rate == pytest.approx(1.04)
     queue = [nxt(STEADY)]
     src = CrossfadeSource(first, lambda deck: queue.pop() if queue else None, stream_factory=tone(0, 20.0),
                           grid_at=lambda record, start, seconds: STEADY, mix_beats=16, verify=unlocked)
@@ -918,19 +1378,21 @@ def test_an_unlocked_transition_echoes_out_under_the_next_record():
     wait_until(lambda: src._queued is not None)
     plan = _plan(src)
     assert plan.kind == "echo" and plan.fallback == "unlocked"
+    assert plan.playback_rate == pytest.approx(1.04)
+    wall_drop = plan.drop / plan.playback_rate
+    wall_beat = plan.beat / plan.playback_rate
     rms = []
-    for _ in range(int((plan.drop + 4.0) * FRAMES_PER_S)):
+    for _ in range(int((wall_drop + 4.0) * FRAMES_PER_S)):
         f = src.read()
         x = np.frombuffer(f, dtype=np.int16).astype(np.float32) if f else np.zeros(1)
         rms.append(float(np.sqrt(np.mean(x * x))))
         if len(rms) % 10 == 0:
             time.sleep(0.005)                    # let the incoming deck's reader keep up
     at = lambda t: rms[int(t * FRAMES_PER_S)]
-    beat = plan.beat
-    assert at(plan.drop - 0.3) > 4000                                # the outgoing, full
-    first_repeat, third_repeat = at(plan.drop + 0.2 * beat), at(plan.drop + 2.2 * beat)
-    assert first_repeat > 1000 and third_repeat < first_repeat       # it rings on, and dies away
-    assert at(plan.drop + (R.ECHO_REPEATS + 1) * beat) < 50          # gone after the repeats
+    assert at(wall_drop - 0.3) > 4000                          # the outgoing, full
+    first_repeat, third_repeat = at(wall_drop + 0.2 * wall_beat), at(wall_drop + 2.2 * wall_beat)
+    assert first_repeat > 1000 and third_repeat < first_repeat  # it rings on, and dies away
+    assert at(wall_drop + (R.ECHO_REPEATS + 1) * wall_beat) < 50  # gone after the repeats
 
 
 class _SlowRenderer:
@@ -1665,9 +2127,880 @@ def test_measured_alternatives_use_normalized_lock_quality_and_artist_variety(mo
     session.graph = graph
     session.crate = [current, good, same_artist, lower_confidence]
     session._rng = random.Random(4)
-    monkeypatch.setattr(beatgrid, "ticks_for", lambda _path: [0.0])
+    session._listener_intent_lock = threading.Lock()
+    session._listener_intent = None
+    session._listener_pick_generation = 0
+    session._listener_intent_min_pick_generation = 1
+    monkeypatch.setattr(beatgrid, "ticks_available", lambda _path, _bpm=None: True)
 
     deck = SimpleNamespace(record=current, grid=SimpleNamespace(bpm=124.0), ratio=1.0)
     ordered = session._candidates(deck)
 
     assert [r.path for r in ordered[:3]] == [good.path, same_artist.path, lower_confidence.path]
+
+
+def test_loudness_gain_cache_is_keyed_by_audio_identity(monkeypatch):
+    identity = {"value": "audio-one"}
+    calls = []
+    monkeypatch.setattr(R.library, "audio_signature", lambda _path, **_kwargs: identity["value"])
+
+    def fake_run(*_args, **_kwargs):
+        calls.append(identity["value"])
+        return types.SimpleNamespace(stderr="I: -15.0 LUFS\nPeak: -2.0 dBFS\n")
+
+    monkeypatch.setattr(R.subprocess, "run", fake_run)
+    R.gain_db.cache_clear()
+    first = R.gain_db("/same/path.mp3")
+    identity["value"] = "audio-two"
+    second = R.gain_db("/same/path.mp3")
+
+    assert first == second
+    assert calls == ["audio-one", "audio-two"]
+    R.gain_db.cache_clear()
+
+
+def test_records_session_checks_audio_graph_identity_off_event_loop(monkeypatch):
+    import threading
+
+    from utils.audio import setlist
+
+    checked = threading.Event()
+    thread_names = []
+    monkeypatch.setattr(setlist, "needs_build",
+                        lambda *_args: thread_names.append(threading.current_thread().name) or checked.set() or False)
+
+    vc = types.SimpleNamespace(
+        guild=types.SimpleNamespace(id=1),
+        channel=types.SimpleNamespace(name="General", members=[]),
+    )
+    session = R.RecordsSession(vc, [], "Ekco")
+    assert checked.wait(2.0)
+    assert thread_names == ["kaia-records-graph-check"]
+    assert session.graph is not None
+
+
+
+
+def test_crossfader_rejects_non_finite_values_without_poisoning_mixer_state():
+    controls = R.Controls()
+    for value in (float("nan"), float("inf"), float("-inf")):
+        assert not controls.set(None, "xfader", value)
+        assert not controls.set(None, "master", value)
+        assert not controls.set(1, "fader", value)
+    assert controls.xfader is None
+    assert controls.master == 1.0
+    assert controls.channels[1]["fader"] == 1.0
+
+
+def test_source_advances_configuration_ramp_once_per_rendered_frame():
+    deck = Deck(rec("crossfade-ramp", 120, "8A"), 1.0, 600.0, tone(1000, 600.0))
+    src = CrossfadeSource(deck, pick=lambda _deck: None, stream_factory=tone(-1000, 600.0), mix_beats=16)
+    src.rides = False
+    wait_for(deck, 12)
+    try:
+        assert src.controls.set(None, "xfader", 0.25)
+        start = (src.controls.channel(1)[3], src.controls.channel(2)[3])
+        assert start == pytest.approx((1.0, 0.5))
+        assert src.controls.set(None, "xfader_curve", "constant_power")
+
+        src.read()
+        after_one = (src.controls.channel(1)[3], src.controls.channel(2)[3])
+        assert after_one[0] < start[0] and after_one[0] > 0.9238795
+        assert after_one[1] < start[1] and after_one[1] > 0.3826834
+
+        for _ in range(src.controls.XFADER_RAMP_FRAMES - 1):
+            src.read()
+        finished = (src.controls.channel(1)[3], src.controls.channel(2)[3])
+        assert finished == pytest.approx((0.9238795325, 0.3826834324), abs=1e-8)
+        assert src.controls._xfader_ramp is None
+    finally:
+        src.cleanup()
+
+
+def test_crossfader_default_curve_preserves_the_existing_overlap_law():
+    controls = R.Controls()
+    assert controls.xfader is None
+    assert controls.xfader_curve == "standard"
+    assert controls.xfader_assignments == {1: "A", 2: "B"}
+
+    controls.set(None, "xfader", 0.25)
+    # The old law holds A full for the first half of travel and B full for
+    # the second half, with both decks full at the centre.
+    assert controls.channel(1)[3] == pytest.approx(1.0)
+    assert controls.channel(2)[3] == pytest.approx(0.5)
+    controls.set(None, "xfader", 0.5)
+    assert controls.channel(1)[3] == pytest.approx(1.0)
+    assert controls.channel(2)[3] == pytest.approx(1.0)
+
+
+def test_crossfader_constant_power_curve_ramps_to_equal_power_targets():
+    controls = R.Controls()
+    controls.set(None, "xfader", 0.25)
+    before = (controls.channel(1)[3], controls.channel(2)[3])
+    assert before == pytest.approx((1.0, 0.5))
+
+    assert controls.set(None, "xfader_curve", "constant_power")
+    # Configuration is staged until the next committed PCM frame.
+    controls.advance_frame()
+    first = (controls.channel(1)[3], controls.channel(2)[3])
+    assert first[0] < before[0] and first[0] > 0.9238795
+    assert first[1] < before[1] and first[1] > 0.3826834
+
+    for _ in range(controls.XFADER_RAMP_FRAMES - 1):
+        controls.advance_frame()
+    final = (controls.channel(1)[3], controls.channel(2)[3])
+    assert final == pytest.approx((0.9238795325, 0.3826834324), abs=1e-8)
+    assert final[0] ** 2 + final[1] ** 2 == pytest.approx(1.0, abs=1e-8)
+
+
+def test_crossfader_cut_curve_switches_at_a_defined_midpoint():
+    controls = R.Controls()
+    controls.set(None, "xfader_curve", "cut")
+    controls.set(None, "xfader", 0.499)
+    assert controls.channel(1)[3] == 1.0
+    assert controls.channel(2)[3] == 0.0
+    controls.set(None, "xfader", 0.5)
+    assert controls.channel(1)[3] == 0.0
+    assert controls.channel(2)[3] == 1.0
+
+
+def test_crossfader_assignment_can_route_a_deck_to_either_side_or_thru():
+    controls = R.Controls()
+    controls.set(None, "xfader", 0.25)
+
+    assert controls.set(1, "xfader_assignment", "B")
+    for _ in range(controls.XFADER_RAMP_FRAMES):
+        controls.advance_frame()
+    assert controls.channel(1)[3] == pytest.approx(0.5)
+    assert controls.channel(2)[3] == pytest.approx(0.5)
+
+    assert controls.set(2, "xfader_assignment", "THRU")
+    for _ in range(controls.XFADER_RAMP_FRAMES):
+        controls.advance_frame()
+    assert controls.channel(2)[3] == pytest.approx(1.0)
+    assert controls.state()["xfader_assignments"] == {"1": "B", "2": "THRU"}
+
+
+def test_crossfader_curve_and_assignment_validation_rejects_unknown_values():
+    controls = R.Controls()
+    assert not controls.set(None, "xfader_curve", "exponential")
+    assert not controls.set(1, "xfader_assignment", "C")
+    assert not controls.set(3, "xfader_assignment", "A")
+    assert controls.xfader_curve == "standard"
+    assert controls.xfader_assignments == {1: "A", 2: "B"}
+
+
+def test_crossfader_direct_fader_movement_is_immediate_during_config_ramp():
+    controls = R.Controls()
+    controls.set(None, "xfader", 0.5)
+    controls.set(None, "xfader_curve", "cut")
+    controls.advance_frame()
+    assert controls._xfader_ramp is not None
+
+    controls.set(None, "xfader", 0.25)
+    assert controls._xfader_ramp is None
+    assert controls.channel(1)[3] == 1.0
+    assert controls.channel(2)[3] == 0.0
+
+
+def _slip_live_position(deck):
+    """The source clock that keeps moving underneath a slip roll."""
+    return (deck.played * FRAME_SAMPLES - deck.pad) / RATE + deck.offset / deck.ratio
+
+
+def test_slip_roll_repeats_predecoded_pcm_while_the_live_deck_clock_advances(loop_source):
+    src = loop_source
+    deck = src.current
+    assert deck is not None
+
+    assert src.set_roll(1, 1, pressed=True)
+    roll = deck._roll
+    assert roll is not None and roll.beats == 1
+    assert len(roll.frames) == 25
+    assert roll.release_played is None
+
+    while deck.played < roll.start_played:
+        deck.frame()
+    first_cycle = [deck.frame() for _ in range(len(roll.frames))]
+    second_cycle = [deck.frame() for _ in range(len(roll.frames))]
+    assert first_cycle == second_cycle
+    assert deck.played == roll.start_played + 2 * len(roll.frames)
+
+    # Deck.at() reports the repeated roll cursor; the independent live clock
+    # has continued beyond the segment and will be restored on release.
+    assert deck.at() == pytest.approx(roll.start_own / deck.ratio)
+    live_before_release = _slip_live_position(deck)
+    assert live_before_release > roll.end_own / deck.ratio
+
+    assert src.set_roll(1, 1, pressed=False)
+    assert deck._roll is not None and deck._roll.release_played == deck.played
+    release_start = deck._roll.release_played
+    deadline = time.monotonic() + 1.0
+    while deck._roll is not None and time.monotonic() < deadline:
+        before = deck.played
+        deck.frame()
+        if deck.played == before:
+            # A temporarily empty decoder returns silence without advancing
+            # the source clock; give its pump time to refill before retrying.
+            time.sleep(0.002)
+    assert deck._roll is None
+    assert deck.played == release_start + R.SLIP_ROLL_RELEASE_FRAMES
+    assert deck.at() == pytest.approx(_slip_live_position(deck))
+    assert deck.at() > roll.end_own / deck.ratio
+
+
+def test_slip_roll_keeps_program_and_pfl_on_the_same_repeating_and_live_frames(loop_source):
+    src = loop_source
+    deck = src.current
+    assert deck is not None
+    src.controls.set(None, "phones", 1.0)
+    src.controls.set(None, "phones_mix", 0.0)
+    assert src.set_headphones(1)
+    stream = src.attach_headphone_stream()
+    assert stream is not None
+
+    try:
+        assert src.set_roll(1, 2, pressed=True)
+        roll = deck._roll
+        head = src._headphones_deck
+        assert roll is not None and head is not None and head._roll is not None
+        while deck.played < roll.start_played:
+            program = src.read()
+            monitor = stream.get_nowait()
+            assert np.allclose(np.frombuffer(program, np.int16),
+                               np.frombuffer(monitor, np.int16), atol=1)
+
+        # The program and isolated PFL repeat exactly the same phrase.
+        for _ in range(len(roll.frames) * 2):
+            program = src.read()
+            monitor = stream.get_nowait()
+            assert np.allclose(np.frombuffer(program, np.int16),
+                               np.frombuffer(monitor, np.int16), atol=1)
+
+        assert deck.played > roll.start_played + len(roll.frames)
+        assert deck.at() == pytest.approx(roll.start_own / deck.ratio)
+        assert _slip_live_position(deck) > roll.end_own / deck.ratio
+
+        assert src.set_roll(1, 2, pressed=False)
+        assert deck._roll is not None and head._roll is not None
+        for _ in range(R.SLIP_ROLL_RELEASE_FRAMES):
+            program = src.read()
+            monitor = stream.get_nowait()
+            assert np.allclose(np.frombuffer(program, np.int16),
+                               np.frombuffer(monitor, np.int16), atol=1)
+        assert deck._roll is None and head._roll is None
+        assert deck.at() == pytest.approx(_slip_live_position(deck))
+    finally:
+        src.detach_headphone_stream(stream)
+        src.set_headphones(None)
+
+
+def test_slip_roll_times_out_and_crossfades_back_when_pointer_release_is_lost(loop_source):
+    from dataclasses import replace
+
+    deck = loop_source.current
+    assert deck is not None
+    src = loop_source
+    assert src.set_roll(1, 1, pressed=True)
+    roll = deck._roll
+    assert roll is not None
+    deck._roll = replace(roll, max_frames=3)
+
+    while deck.played < roll.start_played:
+        deck.frame()
+    for _ in range(3 + R.SLIP_ROLL_RELEASE_FRAMES + 1):
+        deck.frame()
+    assert deck._roll is None
+    assert deck.at() == pytest.approx(_slip_live_position(deck))
+
+
+def test_slip_roll_rejects_conflicting_loop_transition_pause_and_unusable_grids(loop_source):
+    src = loop_source
+    deck = src.current
+    assert deck is not None
+
+    src._planning = True
+    assert not src.set_roll(1, 1, pressed=True)
+    src._planning = False
+
+    src._pending_planning_mode = "skip"
+    assert not src.set_roll(1, 1, pressed=True)
+    src._pending_planning_mode = None
+
+    src.paused.add(1)
+    assert not src.set_roll(1, 1, pressed=True)
+    src.paused.clear()
+
+    deck.grid = Grid(bpm=120.0, downbeat=0.0, contrast=8.0, bar_known=False)
+    assert not src.set_roll(1, 1, pressed=True)
+    deck.grid = STEADY
+
+    assert src.set_loop(1, 2)
+    assert not src.set_roll(1, 1, pressed=True)
+
+
+def test_loop_arming_rechecks_jog_ownership_after_pcm_preparation(loop_source):
+    src = loop_source
+    deck = src.current
+    assert deck is not None and src.set_headphones(1)
+    head = src._headphones_deck
+    assert head is not None
+
+    original_factory = src._factory
+    entered, release = threading.Event(), threading.Event()
+
+    def blocking_factory(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=3.0)
+        return original_factory(*args, **kwargs)
+
+    src._factory = blocking_factory
+    result = []
+    worker = threading.Thread(target=lambda: result.append(src.set_loop(1, 2)), daemon=True)
+    worker.start()
+    try:
+        assert entered.wait(timeout=1.0)
+        assert src.set_bend(1, 1.05)
+    finally:
+        release.set()
+        worker.join(timeout=5.0)
+
+    assert not worker.is_alive()
+    assert result == [False]
+    assert deck.bend_active and head.bend_active
+    assert not deck.loop_active and not head.loop_active
+
+
+def test_slip_roll_arming_rechecks_pitch_ownership_after_pcm_preparation(loop_source):
+    src = loop_source
+    deck = src.current
+    assert deck is not None and src.set_headphones(1)
+    head = src._headphones_deck
+    assert head is not None
+
+    original_factory = src._factory
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_factory(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=3.0)
+        return original_factory(*args, **kwargs)
+
+    src._factory = blocking_factory
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(src.set_roll(1, 2, pressed=True)),
+        daemon=True,
+    )
+    worker.start()
+    try:
+        assert entered.wait(timeout=1.0)
+        # A pitch ramp started while the counted phrase is being decoded.
+        assert src.set_pitch(1, 1.05)
+    finally:
+        release.set()
+        worker.join(timeout=5.0)
+
+    assert not worker.is_alive()
+    assert result == [False]
+    assert deck.pitch_control_active and head.pitch_control_active
+    assert not deck.roll_active and not head.roll_active
+
+
+def test_slip_roll_arming_rechecks_jog_ownership_after_pcm_preparation(loop_source):
+    src = loop_source
+    deck = src.current
+    assert deck is not None and src.set_headphones(1)
+    head = src._headphones_deck
+    assert head is not None
+
+    original_factory = src._factory
+    entered, release = threading.Event(), threading.Event()
+
+    def blocking_factory(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=3.0)
+        return original_factory(*args, **kwargs)
+
+    src._factory = blocking_factory
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(src.set_roll(1, 2, pressed=True)), daemon=True
+    )
+    worker.start()
+    try:
+        assert entered.wait(timeout=1.0)
+        assert src.set_bend(1, 1.05)
+    finally:
+        release.set()
+        worker.join(timeout=5.0)
+
+    assert not worker.is_alive()
+    assert result == [False]
+    assert deck.bend_active and head.bend_active
+    assert not deck.roll_active and not head.roll_active
+
+
+@pytest.mark.parametrize("target,expected_direction", [(1.08, 1), (0.92, -1)])
+def test_live_jog_bend_resamples_the_pcm_and_tracks_the_real_source_cursor(target, expected_direction):
+    values = np.arange(30_000, dtype=np.int16)
+    pcm = np.repeat(values, 2).tobytes()
+
+    def ramp_factory(_path, _ratio, **_kwargs):
+        return io.BytesIO(pcm)
+
+    deck = Deck(rec("jog-ramp", 120, "8A"), 1.0, 0.6, ramp_factory)
+    wait_for(deck, 30)
+    try:
+        start = deck.at()
+        assert deck.set_bend(target)
+        assert deck.bend["active"] is True
+
+        for _ in range(R.PITCH_BEND_RAMP_FRAMES + 12):
+            frame = deck.frame()
+            assert frame is not None and len(frame) == FRAME_BYTES
+
+        assert deck.bend["rate"] == pytest.approx(target, abs=1e-5)
+        output = np.frombuffer(deck.frame(), dtype=np.int16).reshape(-1, 2)[:, 0].astype(np.float32)
+        mean_step = float(np.mean(np.diff(output[100:850])))
+        assert mean_step > 1.04 if expected_direction > 0 else mean_step < 0.96
+
+        consumed = deck._source_samples
+        rendered_frames = R.PITCH_BEND_RAMP_FRAMES + 13
+        neutral_consumption = rendered_frames * FRAME_SAMPLES
+        if expected_direction > 0:
+            assert consumed > neutral_consumption
+        else:
+            assert consumed < neutral_consumption
+        assert deck.at() > start if expected_direction > 0 else deck.at() < start + rendered_frames * FRAME_SAMPLES / RATE
+
+        # Releasing the platter ramps back to 1.0 without jumping the source cursor.
+        before_release = deck._source_samples
+        assert deck.set_bend(1.0, release=True)
+        for _ in range(R.PITCH_BEND_RAMP_FRAMES):
+            assert deck.frame() is not None
+        assert deck.bend["active"] is False
+        assert deck.bend["rate"] == pytest.approx(1.0)
+        assert deck._source_samples > before_release
+        assert deck.at() == pytest.approx(
+            (deck._source_samples - deck.pad) / RATE + deck.offset / deck.ratio
+        )
+    finally:
+        deck.close()
+
+
+def test_live_jog_ring_stays_bounded_across_repeated_slow_holds():
+    values = np.arange(720_000, dtype=np.int16)
+    pcm = np.column_stack((values, values)).astype(np.int16).tobytes()
+
+    def ramp_factory(_path, _ratio, **_kwargs):
+        return io.BytesIO(pcm)
+
+    deck = Deck(rec("repeated-jog", 120, "8A"), 1.0, 15.0, ramp_factory)
+    wait_for(deck, 25)
+    try:
+        for _ in range(5):
+            assert deck.set_bend(0.92)
+            for _ in range(40):
+                frame = deck.frame()
+                assert frame is not None and len(frame) == FRAME_BYTES
+            assert deck.set_bend(1.0, release=True)
+            for _ in range(R.PITCH_BEND_RAMP_FRAMES):
+                frame = deck.frame()
+                assert frame is not None and len(frame) == FRAME_BYTES
+            assert deck.bend_active is False
+            # The ring contains only the interpolation look-ahead, not a
+            # growing backlog from each 8% slow-down.
+            buffered = deck._bend_write_pos - deck._bend_read_pos
+            assert 0 <= buffered < 2 * FRAME_SAMPLES
+            assert deck._bend_capacity == R.PITCH_BEND_BUFFER_FRAMES * FRAME_SAMPLES + 2 * FRAME_SAMPLES
+        assert deck.played == 5 * (40 + R.PITCH_BEND_RAMP_FRAMES)
+        assert deck._source_samples > 0
+    finally:
+        deck.close()
+
+
+def test_live_jog_bend_keeps_program_and_pfl_decoders_in_lockstep(loop_source):
+    src = loop_source
+    deck = src.current
+    assert deck is not None
+    src.controls.set(None, "phones", 1.0)
+    src.controls.set(None, "phones_mix", 0.0)
+    assert src.set_headphones(1)
+    stream = src.attach_headphone_stream()
+    assert stream is not None
+    head = src._headphones_deck
+    assert head is not None
+    try:
+        assert src.set_bend(1, 1.06)
+        for _ in range(R.PITCH_BEND_RAMP_FRAMES + 15):
+            program = src.read()
+            monitor = stream.get_nowait()
+            assert np.allclose(np.frombuffer(program, np.int16),
+                               np.frombuffer(monitor, np.int16), atol=1)
+        assert deck.bend["rate"] == head.bend["rate"] == pytest.approx(1.06)
+        assert deck._source_samples == pytest.approx(head._source_samples, abs=1.0)
+        assert deck.at() == pytest.approx(head.at(), abs=1.0 / R.RATE)
+
+        assert src.set_bend(1, 1.0, release=True)
+        for _ in range(R.PITCH_BEND_RAMP_FRAMES + 2):
+            program = src.read()
+            monitor = stream.get_nowait()
+            assert np.allclose(np.frombuffer(program, np.int16),
+                               np.frombuffer(monitor, np.int16), atol=1)
+        assert not deck.bend_active and not head.bend_active
+        assert deck._source_samples == pytest.approx(head._source_samples, abs=1.0)
+    finally:
+        src.detach_headphone_stream(stream)
+        src.set_headphones(None)
+
+
+def test_live_jog_start_guard_reserves_fastest_rate_timeout_and_release_headroom(loop_source):
+    src = loop_source
+    deck = src.current
+    assert deck is not None
+    original = deck._source_samples
+    try:
+        # At base speed 540 output frames appear to exceed the old 518-frame
+        # guard, but a +8% hold can consume those samples before its 500-frame
+        # timeout and eight-frame return ramp have completed.
+        with src._lock:
+            deck._source_samples = (
+                deck.total_frames * FRAME_SAMPLES - 540 * FRAME_SAMPLES
+            )
+        assert deck.remaining == 540
+        assert not src.set_bend(1, 1.08)
+
+        # Once the same hold has started with sufficient headroom, subsequent
+        # platter updates are not re-rejected as its remaining time decreases.
+        with src._lock:
+            deck._source_samples = (
+                deck.total_frames * FRAME_SAMPLES
+                - (R.PITCH_BEND_START_HEADROOM_FRAMES + 1) * FRAME_SAMPLES
+            )
+        assert src.set_bend(1, 1.08)
+        with src._lock:
+            deck._source_samples = (
+                deck.total_frames * FRAME_SAMPLES - 540 * FRAME_SAMPLES
+            )
+        assert src.set_bend(1, 1.04)
+        assert deck.bend["target"] == pytest.approx(1.04)
+        assert src.set_bend(1, 1.0, release=True)
+    finally:
+        with src._lock:
+            deck._source_samples = original
+
+
+def test_live_jog_bend_validation_conflicts_timeout_and_skip_release(loop_source):
+    src = loop_source
+    deck = src.current
+    assert deck is not None
+
+    for bad in (True, False, float("nan"), float("inf"), 10 ** 1000, 0.91, 1.09, "1.02", None):
+        assert not src.set_bend(1, bad)
+
+    src._planning = True
+    assert not src.set_bend(1, 1.04)
+    src._planning = False
+
+    # The glide worker can be preparing a splice before _splice is published.
+    src._gliding = True
+    assert not src.set_bend(1, 1.04)
+    src._gliding = False
+
+    src.paused.add(1)
+    assert not src.set_bend(1, 1.04)
+    src.paused.clear()
+
+    assert src.set_loop(1, 2)
+    assert not src.set_bend(1, 1.04)
+    assert src.set_loop(1, None)
+    while src._pending_loop_exit is not None:
+        src.read()
+
+    assert src.set_bend(1, 1.04)
+    assert deck.bend_active
+    assert not src.set_loop(1, 2)
+    assert not src.set_roll(1, 1, pressed=True)
+    assert not src.jump_to_cue(1, 5.0)
+    src.skip()
+    assert deck.bend["target"] == pytest.approx(1.0)
+
+
+def test_live_jog_timeout_covers_the_whole_hold_across_the_neutral_crossing(loop_source):
+    src = loop_source
+    deck = src.current
+    assert deck is not None
+
+    assert src.set_bend(1, 1.05)
+    for _ in range(R.PITCH_BEND_RAMP_FRAMES + 2):
+        src.read()
+    assert deck.bend["rate"] == pytest.approx(1.05)
+
+    # Returning to the platter centre is not a pointer release.
+    assert src.set_bend(1, 1.0)
+    assert deck._bend_hold_active is True
+    deck._bend_frames = R.PITCH_BEND_MAX_FRAMES - 1
+    src.read()
+    assert deck._bend_expired is True
+    assert deck._bend_hold_active is False
+    assert src.set_bend(1, 1.06) is False
+
+    # The rate returns to unity and the planner may proceed after the ramp.
+    for _ in range(R.PITCH_BEND_RAMP_FRAMES + 2):
+        src.read()
+    assert deck.bend_active is False
+    assert deck._bend_expired is True
+    assert src.plan is None
+    assert src.set_bend(1, 1.06) is False
+    assert not src.set_loop(1, 2)
+    assert not src.set_roll(1, 1, pressed=True)
+    assert not src.jump_to_cue(1, 5.0)
+
+    # The expired hold stays latched until an explicit release arrives.
+    assert src.set_bend(1, 1.0, release=True)
+    assert deck._bend_expired is False
+    assert src.set_bend(1, 1.04)
+    assert src.set_bend(1, 1.0, release=True)
+
+
+def test_live_jog_bend_defers_automatic_planning_until_neutral(loop_source):
+    src = loop_source
+    deck = src.current
+    assert deck is not None
+    src._glide_next = 0
+    assert src.set_bend(1, 1.04)
+
+    for _ in range(15):
+        src.read()
+    assert src.plan is None
+    assert deck.bend_active
+
+    assert src.set_bend(1, 1.0, release=True)
+    for _ in range(R.PITCH_BEND_RAMP_FRAMES):
+        src.read()
+    assert not deck.bend_active
+
+
+
+def test_pitch_resampler_keeps_whole_samples_after_minutes_on_the_bend_path():
+    """The read cursor grows for as long as the bend path is active. Past
+    2**24 samples a float32 position steps by 2, then 4: repeated and skipped
+    samples instead of a resampled ramp."""
+    values = np.arange(30_000, dtype=np.int16)
+    pcm = np.repeat(values, 2).tobytes()
+    deck = Deck(rec("pitch-ramp", 120, "8A"), 1.0, 0.6, lambda *_a, **_k: io.BytesIO(pcm))
+    wait_for(deck, 30)
+    try:
+        assert deck.set_pitch(1.02, immediate=True)
+        for _ in range(3):
+            assert deck.frame()
+        # Twenty minutes on: shift both cursors by a multiple of the ring's size,
+        # so the ring still maps to the same samples.
+        shift = deck._bend_capacity * ((20 * 60 * RATE) // deck._bend_capacity)
+        assert shift > 2 ** 25
+        deck._bend_read_pos += shift
+        deck._bend_write_pos += shift
+        out = np.frombuffer(deck.frame(), dtype=np.int16).reshape(-1, 2)[:, 0].astype(np.int64)
+        assert set(np.diff(out).tolist()) <= {1, 2}
+    finally:
+        deck.close()
+
+
+def test_persistent_pitch_fader_composes_with_live_jog_and_returns_to_its_setting():
+    deck = Deck(rec("pitch-ride", 120, "8A"), 1.0, 5.0, tone(1000, 5.0))
+    wait_for(deck, 30)
+    try:
+        start = deck.at()
+        assert deck.set_pitch(1.06)
+        assert deck.pitch_ramping
+        for _ in range(R.PITCH_BEND_RAMP_FRAMES):
+            frame = deck.frame()
+            assert frame is not None and len(frame) == FRAME_BYTES
+        assert deck.pitch_rate == pytest.approx(1.06)
+        assert deck.playback_rate == pytest.approx(1.06)
+
+        assert deck.set_bend(1.04)
+        for _ in range(R.PITCH_BEND_RAMP_FRAMES):
+            frame = deck.frame()
+            assert frame is not None and len(frame) == FRAME_BYTES
+        assert deck.playback_rate == pytest.approx(1.06 * 1.04)
+        assert deck.at() > start
+        assert deck.remaining == int(
+            max(0.0, deck.total_frames * FRAME_SAMPLES - deck._source_samples)
+            // (FRAME_SAMPLES * deck.playback_rate)
+        )
+
+        # Jog release returns to the persistent fader, not to unity.
+        assert deck.set_bend(1.0, release=True)
+        for _ in range(R.PITCH_BEND_RAMP_FRAMES):
+            frame = deck.frame()
+            assert frame is not None and len(frame) == FRAME_BYTES
+        assert deck.bend["rate"] == pytest.approx(1.0)
+        assert deck.pitch_rate == pytest.approx(1.06)
+        assert deck.playback_rate == pytest.approx(1.06)
+
+        assert deck.set_pitch(1.0)
+        for _ in range(R.PITCH_BEND_RAMP_FRAMES):
+            frame = deck.frame()
+            assert frame is not None and len(frame) == FRAME_BYTES
+        assert deck.pitch_rate == pytest.approx(1.0)
+        assert deck.playback_rate == pytest.approx(1.0)
+        assert deck.set_pitch(1.081) is False
+        assert deck.set_pitch(True) is False
+        assert deck.set_pitch(float("nan")) is False
+    finally:
+        deck.close()
+
+
+def test_pitch_fader_waits_until_the_tempo_echo_tail_clears(loop_source):
+    src = loop_source
+    deck = src.current
+    assert deck is not None
+
+    assert src.set_echo(True, beats=1.0)
+    assert src.effects.active
+    assert src.set_pitch(1, 1.04) is False
+    assert deck.pitch_rate == pytest.approx(1.0)
+
+    # The input gate is off, but changing tempo during this fixed-delay tail
+    # would still detune its repeats from the beat it was armed against.
+    assert src.set_echo(False)
+    assert src.effects.tail_active
+    assert src.set_pitch(1, 1.04) is False
+
+    for _ in range(200):
+        if not src.effects.tail_active:
+            break
+        src.read()
+    assert not src.effects.tail_active
+    assert src.set_pitch(1, 1.04)
+
+
+def test_transition_planner_matches_the_incoming_deck_to_the_persistent_pitch_rate():
+    plan = plan_transition(
+        3.1, 1.0, STEADY, 60.0, nxt(), "skip", 16, lead=2.0,
+        playback_rate=1.04,
+    )
+    assert plan.kind == "blend"
+    assert plan.playback_rate == pytest.approx(1.04)
+    assert plan.ratio == pytest.approx(1.04)
+    # Transition coordinates remain in decoded-source time; wall BPM changes.
+    assert plan.beat == pytest.approx(0.5)
+    assert plan.length == pytest.approx(8.0)
+    assert plan.drop >= 3.1 + 0.75 + 2.0 * 1.04
+
+
+
+def test_transition_without_outgoing_grid_scales_lead_to_pitch_source_clock():
+    plan = plan_transition(
+        10.0, 1.0, None, 30.0, nxt(), "skip", 16, lead=0.4,
+        playback_rate=1.04,
+    )
+    assert plan.kind == "cut"
+    assert plan.playback_rate == pytest.approx(1.04)
+    assert plan.drop == pytest.approx(10.0 + 0.4 * 1.04)
+
+def test_pfl_replacement_rechecks_pitch_ramp_after_off_lock_decoder_prepare(headphone_source):
+    src = headphone_source
+    assert src.set_headphones(1)
+    old_head = src._headphones_deck
+    assert old_head is not None
+
+    original_factory = src._factory
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_factory(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=3.0)
+        return original_factory(*args, **kwargs)
+
+    src._factory = blocking_factory
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(src.set_headphones(1, force=True)),
+        daemon=True,
+    )
+    worker.start()
+    try:
+        # The preview has captured the current 1.0 pitch rate and is building
+        # outside the mixer lock. Change the fader before the next render frame
+        # moves the instantaneous rate away from 1.0.
+        assert entered.wait(timeout=1.0)
+        assert src.set_pitch(1, 1.05)
+        assert src.current is not None and src.current.pitch_ramping
+        assert old_head.pitch_ramping
+    finally:
+        release.set()
+        worker.join(timeout=5.0)
+
+    assert not worker.is_alive()
+    assert result == [False]
+    assert src._headphones_deck is old_head
+    assert src.current is not None and src.current.pitch_ramping
+    assert old_head.pitch_ramping
+
+def test_pfl_replacement_rechecks_jog_ownership_after_off_lock_decoder_prepare(headphone_source):
+    src = headphone_source
+    assert src.set_headphones(1)
+    old_head = src._headphones_deck
+    assert old_head is not None
+
+    original_factory = src._factory
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_factory(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=3.0)
+        return original_factory(*args, **kwargs)
+
+    src._factory = blocking_factory
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(src.set_headphones(1, force=True)),
+        daemon=True,
+    )
+    worker.start()
+    try:
+        assert entered.wait(timeout=1.0)
+        # A momentary jog starts after the preview captured the old rate but
+        # before the replacement decoder can be committed.
+        assert src.set_bend(1, 1.05)
+        assert src.current is not None and src.current.bend_active
+        assert old_head.bend_active
+    finally:
+        release.set()
+        worker.join(timeout=5.0)
+
+    assert not worker.is_alive()
+    assert result == [False]
+    assert src._headphones_deck is old_head
+    assert src.current is not None and src.current.bend_active
+    assert old_head.bend_active
+
+def test_pfl_can_be_rebuilt_at_a_steady_non_unity_pitch(headphone_source):
+    src = headphone_source
+    assert src.set_headphones(1)
+    assert src.set_pitch(1, 1.05)
+    for _ in range(R.PITCH_BEND_RAMP_FRAMES + 1):
+        src.read()
+
+    program = src.current
+    old_head = src._headphones_deck
+    assert program is not None and old_head is not None
+    assert not program.pitch_ramping and not old_head.pitch_ramping
+    assert program.pitch_rate == pytest.approx(1.05)
+    assert old_head.pitch_rate == pytest.approx(1.05)
+
+    # A steady fader setting is inherited by a fresh decoder; only a ramp
+    # in flight should make the off-lock preview stale.
+    assert src.set_headphones(1, force=True)
+    preview = src._headphones_deck
+    assert preview is not None and preview is not old_head
+    assert preview.pitch_rate == pytest.approx(1.05)
+    assert not preview.pitch_ramping
+    assert preview.at() == pytest.approx(program.at(), abs=1 / R.FRAMES_PER_S)
+

@@ -12,8 +12,10 @@ Run by the system Python, which has Essentia (the bot's venv does not):
     /usr/bin/python3 tools/maintenance/beat_ticks.py PATH [PATH…]        # these records
     /usr/bin/python3 tools/maintenance/beat_ticks.py --catalog FILE       # a whole dj_catalog.json
 
-Each record's ticks go to <cache>/<sha1 of path>.json: {"bpm", "confidence",
-"ticks"}. A tracker that lands on half or double the catalog's tempo is folded
+Each record's ticks go to <cache>/<sha1 of path>.json with BPM, confidence,
+ticks, the complete audio signature and requested folding BPM. An entry is
+retained only while both identities match. A tracker that lands on half or
+double the catalog's tempo is folded
 back to it (half-time ticks get the beats between them). Existing entries are
 kept unless --force. Prints one line per record; exits non-zero if any failed.
 
@@ -31,8 +33,14 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from utils.audio.audio_identity import audio_signature
+
 CACHE = ROOT / "memory" / "records" / "ticks"
 
 
@@ -53,33 +61,45 @@ def _decode(path: str):
 
 
 def fold(bpm: float, ticks, want):
-    """Ticks at the catalog's tempo: half time gets the beats between ticks,
-    double time keeps every other tick."""
+    """Fold octave tempo errors without discarding the alternate double-tempo phase."""
     import numpy as np
     ticks = np.asarray(ticks, dtype=float)
     if not want or len(ticks) < 4:
-        return bpm, ticks
+        return bpm, ticks, None
     r = bpm / want
     if 0.45 < r < 0.55:
         mids = (ticks[:-1] + ticks[1:]) / 2
-        return bpm * 2, np.sort(np.concatenate([ticks, mids]))
+        return bpm * 2, np.sort(np.concatenate([ticks, mids])), None
     if 1.8 < r < 2.2:
-        # every other tick, the phase whose ticks sit on the louder onsets is unknown here: take the first
-        return bpm / 2, ticks[::2]
-    return bpm, ticks
+        # Both phases are plausible at half the tracker rate. The runtime grid
+        # chooses one only when its local onset evidence clearly prefers it.
+        return bpm / 2, ticks[::2], ticks[1::2]
+    return bpm, ticks, None
 
 
-def analyse(path: str, want_bpm=None) -> dict:
+def analyse(path: str, want_bpm=None, identity: Optional[str] = None) -> dict:
     import essentia
     essentia.log.infoActive = False
     import essentia.standard as es
+    identity = identity or audio_signature(path)
+    if identity is None:
+        raise ValueError("could not identify record audio")
     x = _decode(path)
     if len(x) < 44100 * 10:
         raise ValueError("under ten seconds of audio")
     bpm, ticks, conf, _, _ = es.RhythmExtractor2013(method="multifeature")(x)
-    bpm, ticks = fold(float(bpm), ticks, want_bpm)
-    return {"bpm": round(float(bpm), 3), "confidence": round(float(conf), 3),
-            "ticks": [round(float(t), 4) for t in ticks]}
+    bpm, ticks, alternate_ticks = fold(float(bpm), ticks, want_bpm)
+    if audio_signature(path, refresh=True) != identity:
+        raise RuntimeError("record audio changed while beat ticks were being analysed")
+    return {
+        "bpm": round(float(bpm), 3),
+        "confidence": round(float(conf), 3),
+        "audio_signature": identity,
+        "target_bpm": round(float(want_bpm), 3) if want_bpm else None,
+        "ticks": [round(float(t), 4) for t in ticks],
+        "alternate_ticks": ([round(float(t), 4) for t in alternate_ticks]
+                            if alternate_ticks is not None else None),
+    }
 
 
 def _write(dest: Path, data: dict) -> None:
@@ -107,10 +127,31 @@ def main() -> int:
     failed = 0
     for path, bpm in jobs:
         dest = cache_path(path, cache)
-        if dest.exists() and not a.force:
-            continue
         try:
-            data = analyse(path, bpm)
+            identity = audio_signature(path)
+            if identity is None:
+                raise ValueError("could not identify record audio")
+            if dest.exists() and not a.force:
+                try:
+                    cached = json.loads(dest.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    cached = {}
+                target_bpm = round(float(bpm), 3) if bpm else None
+                alternate = cached.get("alternate_ticks")
+                phase_cache_complete = (
+                    alternate is None
+                    or (isinstance(alternate, list) and len(alternate) >= 16)
+                )
+                if (cached.get("audio_signature") == identity
+                        and "target_bpm" in cached
+                        and "alternate_ticks" in cached
+                        and phase_cache_complete
+                        and cached.get("target_bpm") == target_bpm):
+                    continue
+            data = analyse(path, bpm, identity=identity)
+            # A missing field is a legacy schema and must be regenerated once;
+            # test doubles and future alternate analyzers still write explicit null.
+            data.setdefault("alternate_ticks", None)
             _write(dest, data)
             print(f"ok   {data['bpm']:7.2f} bpm  conf {data['confidence']:.2f}  {len(data['ticks'])} beats  {os.path.basename(path)}")
         except Exception as e:

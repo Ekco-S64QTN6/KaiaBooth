@@ -37,7 +37,7 @@ VERSION = 2
 #: evidence.
 METHOD = 5
 # Playlist taste changes rebuild paths, not the expensive measured audio graph.
-SET_METHOD = 2
+SET_METHOD = 3
 MAX_SETS = 16
 #: A set runs about an hour: it is walked until it reaches SET_TARGET_S of
 #: played time, and one that cannot reach SET_MIN_S is not a set.
@@ -150,7 +150,8 @@ HAND_CUES = (None, 0, 8)
 
 def find_blend(now: float, out_path: str, out_ratio: float, out_grid, music_end: float, nxt, mode: str,
                mix_beats: int, lead: float = 2.0, verify_fn: Optional[Callable] = None,
-               budget_s: Optional[float] = None, lengths: Optional[list] = None, swaps=()):
+               budget_s: Optional[float] = None, lengths: Optional[list] = None, swaps=(),
+               out_rate: float = 1.0):
     """The first place a blend into `nxt` locks, searched the way a DJ looks for
     one: with the bass swap where the outgoing changes (`swaps`: seconds as
     played and what is there — its outro, its last breakdown; a real blend
@@ -175,10 +176,10 @@ def find_blend(now: float, out_path: str, out_ratio: float, out_grid, music_end:
         if key in seen:
             return None
         seen.add(key)
-        v, shift = verify_fn(out_path, out_ratio, nxt.record.path, plan)
+        v, shift = verify_fn(out_path, out_ratio * out_rate, nxt.record.path, plan)
         if not v.locked:
             return None
-        plan.start += shift
+        plan.start += shift * out_rate
         plan.check = v.summary() + (f"; moved {shift * 1000:+.0f} ms" if shift else "")
         return plan, v, shift, how
 
@@ -189,7 +190,7 @@ def find_blend(now: float, out_path: str, out_ratio: float, out_grid, music_end:
                     if budget_s and time.time() - started > budget_s / 2:
                         break
                     plan = R.plan_transition(now, out_ratio, out_grid, music_end, nxt, mode, beats, lead=lead,
-                                             in_bars=cue, swap_at=at)
+                                             in_bars=cue, swap_at=at, playback_rate=out_rate)
                     if plan.kind != "blend":
                         if plan.fallback == "tempo":
                             return None
@@ -219,7 +220,7 @@ def find_blend(now: float, out_path: str, out_ratio: float, out_grid, music_end:
                     if budget_s and time.time() - started > budget_s:
                         return "out of time"
                     plan = R.plan_transition(at, out_ratio, out_grid, end, nxt, mode, beats, lead=lead, in_bars=cue,
-                                             not_before=floor)
+                                             not_before=floor, playback_rate=out_rate)
                     if plan.kind != "blend":
                         if plan.fallback == "tempo":
                             return "no tempo"
@@ -258,16 +259,18 @@ def verify(out_path: str, out_ratio: float, in_path: str, plan):
     args = (out_path, out_ratio, in_path, plan.ratio)
     # Measured for as long as both are heard: to the outgoing gone, not the
     # blend's nominal length.
-    heard = getattr(plan, "done", plan.drop + plan.length) - plan.drop
-    v = mixcheck.check(*args, plan.start, plan.offset, plan.drop, heard, plan.beat)
+    rate = max(0.01, float(getattr(plan, "playback_rate", 1.0)))
+    heard = (getattr(plan, "done", plan.drop + plan.length) - plan.drop) / rate
+    start, drop, beat = plan.start / rate, plan.drop / rate, plan.beat / rate
+    v = mixcheck.check(*args, start, plan.offset, drop, heard, beat)
     if v.locked or v.correction_ms is None:
         return v, 0.0
-    refused = mixcheck.move_refused(v, plan.beat)
+    refused = mixcheck.move_refused(v, beat)
     if refused:
         v.why = refused
         return v, 0.0
     shift = -v.correction_ms / 1000.0
-    v2 = mixcheck.check(*args, plan.start + shift, plan.offset, plan.drop, heard, plan.beat)
+    v2 = mixcheck.check(*args, start + shift, plan.offset, drop, heard, beat)
     return (v2, shift) if v2.locked else (v, 0.0)
 
 
@@ -303,18 +306,25 @@ def building() -> bool:
 
 
 def _changed(entry: Optional[dict], path: str) -> bool:
-    """The file's audio is not what the graph measured: new, or a different
-    signature (`library.audio_signature`). A file only retagged is unchanged."""
+    """Whether the complete audio payload differs from the graph's identity."""
     from utils.audio import library
     if not entry:
         return True
-    try:
-        if entry.get("mtime") == os.path.getmtime(path):
-            return False
-    except OSError:
-        return False
-    sig = entry.get("sig")
-    return sig is None or sig != library.audio_signature(path)
+    current = library.audio_signature(path)
+    # Missing/legacy identity is not evidence that the old measurements are safe.
+    return current is None or entry.get("sig") != current
+
+
+def _forget_record(g: dict, path: str) -> None:
+    """Drop every measured edge and checked marker involving one changed file."""
+    g.get("records", {}).pop(path, None)
+    g.get("edges", {}).pop(path, None)
+    g.get("checked", {}).pop(path, None)
+    for edges in g.get("edges", {}).values():
+        edges.pop(path, None)
+    for checked in g.get("checked", {}).values():
+        if path in checked:
+            checked.remove(path)
 
 
 def needs_build(g: dict, crate: list) -> bool:
@@ -345,21 +355,30 @@ def pending(g: dict, crate: list) -> dict:
 
 
 _W_LIVE: dict = {}
+_W_IDENTITIES: dict[str, str] = {}
 _W_SIDES: dict = {}
 
 
 def _side(path: str) -> Optional[_Side]:
-    """A worker's _Side for `path`, read once."""
-    if path not in _W_SIDES:
+    """A worker's analysis for this exact audio payload, read once."""
+    identity = _W_IDENTITIES.get(path)
+    if not identity:
+        return None
+    key = (path, identity)
+    if key not in _W_SIDES:
         try:
-            _W_SIDES[path] = _Side(_W_LIVE[path])
+            side: Optional[_Side] = _Side(_W_LIVE[path])
+            from utils.audio import library
+            if library.audio_signature(path, refresh=True) != identity:
+                side = None
+            _W_SIDES[key] = side
         except Exception as e:
             log_debug(f"[sets] {path} not readable: {e}")
-            _W_SIDES[path] = None
+            _W_SIDES[key] = None
         if len(_W_SIDES) > 400:
             _W_SIDES.pop(next(iter(_W_SIDES)))
-    s = _W_SIDES[path]
-    return s if s is not None and s.ok else None
+    side = _W_SIDES[key]
+    return side if side is not None and side.ok else None
 
 
 def _worker_init() -> None:
@@ -420,35 +439,37 @@ def build(crate: list, budget_s: Optional[float] = None,
             try:
                 m = os.path.getmtime(p)
             except OSError:
+                _forget_record(g, p)
                 continue
+            signature = library.audio_signature(p)
             entry = g["records"].get(p)
-            if entry and entry.get("mtime") != m and not _changed(entry, p):
-                entry["mtime"] = m                          # retagged, same audio: kept
-            elif not entry or entry.get("mtime") != m:      # new or changed: measure it again
-                g["records"][p] = {"mtime": m, "sig": library.audio_signature(p)}
-                g["edges"].pop(p, None)
-                g["checked"].pop(p, None)
-                for e in g["edges"].values():
-                    e.pop(p, None)
-                for c in g["checked"].values():
-                    if p in c:
-                        c.remove(p)
-            if not g["records"][p].get("sig"):
-                g["records"][p]["sig"] = library.audio_signature(p)
+            if signature is None:
+                _forget_record(g, p)
+                continue
+            if entry and entry.get("sig") == signature:
+                # A tag-only retag changes the stat, not the audio identity.
+                entry["mtime"] = m
+            else:
+                _forget_record(g, p)
+                g["records"][p] = {"mtime": m, "sig": signature}
             if not g["records"][p].get("seconds"):
                 from utils.audio import records as R
                 g["records"][p]["seconds"] = R.probe_seconds(p)
+        valid = {p for p in live if g["records"].get(p, {}).get("sig")}
         rows = []
         for a_path, a_rec in live.items():
+            if a_path not in valid:
+                continue
             checked = set(g["checked"].get(a_path, []))
-            cands = [b.path for b in live.values() if b.path != a_path and b.path not in checked
-                     and library.tempo_ratio(a_rec.bpm, b.bpm)]
+            cands = [b.path for b in live.values() if b.path in valid and b.path != a_path
+                     and b.path not in checked and library.tempo_ratio(a_rec.bpm, b.bpm)]
             if cands:
                 rows.append((a_path, cands))
         measured = locked = 0
         jobs = max(1, min(jobs, len(rows)))
-        global _W_LIVE
+        global _W_LIVE, _W_IDENTITIES
         _W_LIVE = live
+        _W_IDENTITIES = {p: g["records"][p]["sig"] for p in valid}
         if jobs > 1:
             import multiprocessing
             pool = multiprocessing.get_context("fork").Pool(jobs, initializer=_worker_init)
@@ -473,7 +494,8 @@ def build(crate: list, budget_s: Optional[float] = None,
         finally:
             if pool is not None:
                 pool.terminate()
-        g["sets"] = make_sets(g, live)
+        profiles = build_profiles(live, g)
+        g["sets"] = make_sets(g, live, profiles=profiles)
         g["built"] = time.time()
         with _lock:
             save(g)
@@ -492,6 +514,33 @@ def family(rec) -> str:
         if any(w in g for w in words):
             return name
     return "Electronic"
+
+
+
+def build_profiles(live: dict, graph: Optional[dict] = None) -> dict:
+    """Build/read phrase profiles off the voice callback for set planning.
+
+    songmap owns cache identity and background-only analysis. Missing or failed
+    profiles are omitted; the musical policy treats them as neutral evidence.
+    """
+    from utils.audio import songmap
+    if graph is not None:
+        endpoints = set(graph.get("edges", {}))
+        for destinations in graph.get("edges", {}).values():
+            endpoints.update(destinations)
+        live = {path: record for path, record in live.items() if path in endpoints}
+    profiles = {}
+    for path, record in live.items():
+        if not os.path.isfile(path):
+            continue
+        try:
+            profile = songmap.phrase_profile(path, record.bpm)
+        except Exception as exc:
+            log_debug(f"[sets] no musical profile for {path}: {exc}")
+            continue
+        if profile is not None:
+            profiles[path] = profile
+    return profiles
 
 
 def _seconds(g: dict, path: str) -> float:
@@ -575,15 +624,18 @@ def transition_rank(current, candidate, edge: Optional[dict], *, history=(),
     )
 
 
-def make_sets(g: dict, live: dict, rng: Optional[random.Random] = None) -> list:
-    """Sets walked through the graph, about an hour each: every next record a
-    measured lock from the one before, no song twice in a set (another file or
-    mix of it included), held to one genre family where the graph allows,
-    preferring a key it sits with and records the other sets have not used.
-    Each start is searched (depth first, backing out of dead ends) until the
-    walk reaches SET_TARGET_S; one that cannot reach SET_MIN_S is dropped."""
-    from utils.audio import library
+def make_sets(g: dict, live: dict, rng: Optional[random.Random] = None,
+              *, profiles: Optional[dict] = None) -> list:
+    """Build measured-lock sets, with profile preference and set-arc context.
+
+    Technical feasibility remains the measured graph's hard boundary.
+    Phrase evidence only reorders those edges: a cluttered moment is deferred
+    when another measured option exists, but never silently deleted. Missing
+    profiles fall back to the prior transition ranking.
+    """
+    from utils.audio import library, musical_plan
     rng = rng or random.Random(1)
+    profiles = profiles or {}
     secs_known = any(_seconds(g, p) for p in live)
 
     def eligible(p):
@@ -596,8 +648,18 @@ def make_sets(g: dict, live: dict, rng: Optional[random.Random] = None) -> list:
     fam = {p: family(live[p]) for p in live}
     used: dict = {}
     sets: list = []
+    assessment_cache = {}
     target = SET_TARGET_S if secs_known else float("inf")
     floor = SET_MIN_S if secs_known else 0.0
+
+    def assessment(a: str, b: str):
+        key = (a, b)
+        if key not in assessment_cache:
+            assessment_cache[key] = musical_plan.assess_transition(
+                live[a], live[b], edges.get(a, {}).get(b),
+                profiles.get(a), profiles.get(b),
+            )
+        return assessment_cache[key]
 
     def length(path):
         return played_seconds(g, path, live) if secs_known else float(len(path))
@@ -618,7 +680,17 @@ def make_sets(g: dict, live: dict, rng: Optional[random.Random] = None) -> list:
                     history=[live[p] for p in path], start_family=fam[start],
                     onward=ahead,
                 )
-                return rank[:-1] + (used.get(b, 0), rng.random())
+                recent_roles = [
+                    assessment(a, nxt).incoming_role
+                    for a, nxt in zip(path, path[1:])
+                    if assessment(a, nxt).available
+                ]
+                candidate_assessment = assessment(cur, b)
+                preference, _ = musical_plan.contextual_score(candidate_assessment, recent_roles)
+                # Musical preference may outrank a duller measured option,
+                # while the rank remains an explicit tie-breaker. All options
+                # here are still measured locks.
+                return (-preference, rank[:-1], used.get(b, 0), rng.random())
             # Keep the whole ranked frontier. The bounded DFS below widens
             # from the best five to further candidates when preferred paths
             # dead-end; truncating here made backtracking unable to see them.
@@ -676,9 +748,44 @@ def make_sets(g: dict, live: dict, rng: Optional[random.Random] = None) -> list:
         for p in path:
             used[p] = used.get(p, 0) + 1
     sets.sort(key=lambda st: (family_of(st, live), min(live[p].bpm or 0 for p in st)))
+
+    # Persist only selected-decision explanations, not the potentially large
+    # profile arrays. Technical facts and musical observations stay separate.
+    plans = []
+    for index, path in enumerate(sets):
+        transitions = []
+        recent_roles: list[str] = []
+        for a, b in zip(path, path[1:]):
+            edge = edges.get(a, {}).get(b, {})
+            judged = assessment(a, b)
+            contextual, arc_reasons = musical_plan.contextual_score(judged, recent_roles)
+            technical = {
+                "measured_lock": bool(edge),
+                "beats": edge.get("beats"),
+                "back": edge.get("back"),
+                "cue": edge.get("cue"),
+                "ratio": edge.get("ratio"),
+                "agreement": edge.get("agree"),
+                "bars": edge.get("bars"),
+                "shift_ms": edge.get("ms"),
+            }
+            transitions.append({
+                "from": a,
+                "to": b,
+                "technical": technical,
+                "musical": judged.trace(),
+                "arc": {
+                    "recent_roles": list(recent_roles),
+                    "contextual_preference": contextual,
+                    "reasons": list(arc_reasons),
+                },
+            })
+            if judged.available and judged.incoming_role != "unknown":
+                recent_roles.append(judged.incoming_role)
+        plans.append({"set_index": index, "transitions": transitions})
+    g["set_plans"] = plans
     g["sets_method"] = SET_METHOD
     return sets
-
 
 def family_of(st: list, live: dict) -> str:
     """A set's genre family: the one most of its records are in."""

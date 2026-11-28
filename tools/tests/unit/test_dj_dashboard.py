@@ -1,9 +1,11 @@
-"""The DJ booth shows the mixer's own state and its one control is the real skip."""
+"""Unit and HTTP tests for the DJ booth's real mixer and deck controls."""
 import io
 import json
 import time
+import threading
 import types
 import urllib.request
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -129,6 +131,157 @@ def test_the_booth_serves_state_and_skips(session, monkeypatch):
         srv, D._server = D._server, None
         srv.shutdown()
 
+
+def test_headphone_route_serves_pfl_pcm_and_reports_selected_deck(session, monkeypatch):
+    monkeypatch.setattr(D, "_cfg", lambda k, d: 0 if k == "dj_dashboard_port" else d)
+    src = session.source
+    base = D.serve()
+    response = None
+    worker = None
+    try:
+        request = urllib.request.Request(
+            base + "phones",
+            data=json.dumps({"slot": 1}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as result:
+            assert result.status == 204
+        assert src._headphones_slot == 1
+        assert D.snapshot(session)["headphones"] == {"slot": 1, "id": D.track_id(src._headphones_deck.record.path)}
+
+        response = urllib.request.urlopen(base + "phones/stream", timeout=5)
+        assert response.status == 200
+        assert response.headers.get("X-Kaia-PCM") == "s16le;rate=48000;channels=2;frame_ms=20"
+        assert response.headers.get("Transfer-Encoding") == "chunked"
+
+        def render():
+            for _ in range(20):
+                src.read()
+
+        worker = threading.Thread(target=render, daemon=True)
+        worker.start()
+        frame = response.read(R.FRAME_BYTES)
+        assert len(frame) == R.FRAME_BYTES
+        assert np.max(np.abs(np.frombuffer(frame, dtype=np.int16))) > 0
+    finally:
+        if response is not None:
+            response.close()
+        if worker is not None:
+            worker.join(timeout=2)
+        src.set_headphones(None)
+        server, D._server = D._server, None
+        if server:
+            server.shutdown()
+
+
+def test_booth_asset_routes_phones_through_audio_worklet_not_track_files():
+    page = D.PAGE.read_text(encoding="utf-8")
+    assert 'id="phmix"' in page
+    assert 'phones_mix' in page
+    assert '"/phones/stream"' in page
+    assert "AudioWorkletNode" in page
+    assert 'new Audio("/audio/' not in page
+    assert "phonesTick" not in page
+    assert 'data-cue-kind="memory"' in page
+    assert 'data-cue-kind="hot"' in page
+    assert 'post("/cuebank"' in page
+    assert 'e.shiftKey ? "store" : "toggle"' in page
+    assert 'e.preventDefault(); sendCueBank("hot", index, "clear")' in page
+    assert 'data-loop-beats="1"' in page
+    assert 'data-loop-beats="8"' in page
+    assert 'post("/loop"' in page
+    assert 'data-loop-exit' in page
+
+
+def test_hot_and_memory_cue_http_controls_store_recall_clear_and_publish_state(session, monkeypatch, tmp_path):
+    monkeypatch.setattr(D, "_cfg", lambda k, d: 0 if k == "dj_dashboard_port" else d)
+    monkeypatch.setattr(D.record_cues, "record_key", lambda record: record.path)
+    monkeypatch.setattr(D.record_cues, "telemetry_path", lambda _path: str(tmp_path / "cues.json"))
+    D.record_cues.clear_cache()
+    src = session.source
+    for _ in range(20):
+        src.read()
+    record = src.current.record
+    base = D.serve()
+
+    def send(payload):
+        request = urllib.request.Request(
+            base + "cuebank",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return json.loads(response.read())
+
+    try:
+        expected = src.current.at() * src.current.ratio
+        stored = send({"slot": 1, "kind": "hot", "index": 0, "action": "toggle"})
+        assert stored["action"] == "stored"
+        assert stored["cue_bank"]["hot"][0] == pytest.approx(expected)
+        memory = send({"slot": 1, "kind": "memory", "action": "toggle"})
+        assert memory["action"] == "stored"
+        snapshot = D.snapshot(session)
+        assert snapshot["decks"]["1"]["cue_bank"]["memory"] == pytest.approx(expected)
+
+        assert D.record_cues.set_hot(record, 0, 5.0)
+        old_deck = src.current
+        jumped = send({"slot": 1, "kind": "hot", "index": 0, "action": "toggle"})
+        assert jumped["action"] == "jumped"
+        assert src.current is not old_deck
+        assert src.current.at() * src.current.ratio == pytest.approx(5.0, abs=0.03)
+
+        cleared = send({"slot": 1, "kind": "hot", "index": 0, "action": "clear"})
+        assert cleared["action"] == "cleared"
+        assert cleared["cue_bank"]["hot"][0] is None
+    finally:
+        D.record_cues.clear_cache()
+        server, D._server = D._server, None
+        if server:
+            server.shutdown()
+
+def test_loop_http_route_validates_lengths_and_delegates_to_the_renderer(session, monkeypatch):
+    monkeypatch.setattr(D, "_cfg", lambda k, d: 0 if k == "dj_dashboard_port" else d)
+    calls = []
+    monkeypatch.setattr(session.source, "set_loop", lambda slot, beats: calls.append((slot, beats)) or True)
+    base = D.serve()
+
+    def request(payload):
+        req = urllib.request.Request(
+            base + "loop",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        return urllib.request.urlopen(req, timeout=5)
+
+    try:
+        with request({"slot": 1, "action": "set", "beats": 4}) as response:
+            assert response.status == 204
+        with request({"slot": "2", "action": "exit"}) as response:
+            assert response.status == 204
+        assert calls == [(1, 4), (2, None)]
+        for invalid in (
+            {"slot": 1, "action": "set", "beats": 16},
+            {"slot": True, "action": "set", "beats": 2},
+            {"slot": 1, "action": "set", "beats": True},
+            {"slot": 1, "action": "other"},
+        ):
+            with pytest.raises(urllib.error.HTTPError) as error:
+                request(invalid)
+            assert error.value.code == 400
+        with pytest.raises(urllib.error.HTTPError) as error:
+            req = urllib.request.Request(
+                base + "loop", data=json.dumps({"slot": 1, "action": "set", "beats": 2}).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            monkeypatch.setattr(session.source, "set_loop", lambda *_args: False)
+            urllib.request.urlopen(req, timeout=5)
+        assert error.value.code == 409
+    finally:
+        server, D._server = D._server, None
+        if server:
+            server.shutdown()
 
 def test_decks_alternate_like_a_pair_of_cdjs(session):
     session.source.skip()
@@ -415,6 +568,7 @@ def test_every_booth_launch_is_counted_so_an_open_page_shows_a_new_portrait(monk
     """The booth window is reused across sets; the page reloads (and picks a
     new portrait of her) when the launch count it saw changes."""
     monkeypatch.setattr(D, "_launch", 0)
+    monkeypatch.setattr(D, "_cfg", lambda _key, default=None: default)
     monkeypatch.setattr(D, "serve", lambda: "http://127.0.0.1:1/")
     monkeypatch.setattr(D, "viewers", lambda: 1)              # a page already open: reused
     monkeypatch.setattr(D, "_served_at", 0.0)
@@ -439,3 +593,377 @@ def test_a_configured_booth_browser_still_wins(monkeypatch):
     monkeypatch.setattr(D, "_cfg", lambda key, default=None: "/opt/brave/brave" if key == "dj_browser" else default)
     monkeypatch.setattr(D.shutil, "which", lambda name: "/usr/bin/" + name)
     assert D._browser() == "/opt/brave/brave"
+
+
+def test_snapshot_exposes_skill_catalog_and_manual_lane_ownership(session):
+    src = session.source
+    before = D.snapshot(session)["skills"]
+    assert before["enabled"] is True
+    assert "solo_build_pressure" in before["catalog"]
+    assert "blend_headroom_ride" in before["catalog"]
+    assert "eq.low" in before["engine_capabilities"]
+    assert "transition.echo_tail" in before["engine_capabilities"]
+    assert before["manual_overrides"] == []
+
+    assert src.set_control(1, "high", 0.7)
+    after = D.snapshot(session)["skills"]
+    assert ("1", "high") in [tuple(item) for item in after["manual_overrides"]]
+    assert after["active"]["id"] == "manual_override"
+    assert after["active"]["parameters"] == {"high": 0.7}
+    assert after["active"]["phrase"]["kind"] == "manual release window"
+
+    src.skill_scheduler.hand_back_all()
+    handed_back = D.snapshot(session)["skills"]
+    assert handed_back["manual_overrides"] == []
+    assert handed_back["enabled"] is True
+
+
+def test_booth_asset_exposes_crossfader_curve_and_assignment_controls():
+    page = D.PAGE.read_text(encoding="utf-8")
+    assert 'id="xfcurve"' in page
+    assert 'id="xfassign1"' in page
+    assert 'id="xfassign2"' in page
+    assert 'value="constant_power"' in page
+    assert 'value="cut"' in page
+    assert 'post("/control", { slot, name, value: $(id).value })' in page
+
+
+def test_booth_asset_displays_skill_name_and_explanation():
+    page = D.PAGE.read_text(encoding="utf-8")
+    assert "S.skills && S.skills.active" in page
+    assert "skill.name" in page
+    assert "skill.label" in page
+    assert "skill.parameters" in page
+    assert "skill.phrase" in page
+    assert "parameterText" in page
+    assert "phraseText" in page
+    assert "manualText" in page
+    assert "manual_overrides" in page
+
+
+
+
+def test_booth_control_rides_and_reset_routes_transfer_skill_ownership(session, monkeypatch):
+    monkeypatch.setattr(D, "_cfg", lambda k, d: 0 if k == "dj_dashboard_port" else d)
+    src = session.source
+    base = D.serve()
+
+    def post(path, payload=None):
+        data = json.dumps(payload or {}).encode()
+        req = urllib.request.Request(
+            base + path,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            assert response.status == 204
+
+    try:
+        # The real booth control route must use CrossfadeSource.set_control,
+        # not write directly around the scheduler's ownership tracking.
+        post("/control", {"slot": 1, "name": "high", "value": 0.65})
+        assert src.controls.channels[1]["high"] == pytest.approx(0.65)
+        state = D.snapshot(session)["skills"]
+        assert ("1", "high") in [tuple(item) for item in state["manual_overrides"]]
+        assert state["active"]["parameters"] == {"high": 0.65}
+
+        # String-valued mixer configuration must pass through set_control
+        # without being misread as an EQ/fader value for manual ownership.
+        manual_before = list(src.skill_scheduler.snapshot()["manual_overrides"])
+        post("/control", {"slot": None, "name": "xfader_curve", "value": "constant_power"})
+        post("/control", {"slot": 2, "name": "xfader_assignment", "value": "THRU"})
+        post("/control", {"slot": None, "name": "xfader", "value": 0.15})
+        controls = D.snapshot(session)["controls"]
+        assert controls["xfader_curve"] == "constant_power"
+        assert controls["xfader_assignments"] == {"1": "A", "2": "THRU"}
+        assert controls["xfader"] == pytest.approx(0.15)
+        assert src.skill_scheduler.snapshot()["manual_overrides"] == manual_before
+
+        # HANDS off pauses skills; turning it back on resumes Kaia automation.
+        post("/rides")
+        assert src.rides is False and src.skill_scheduler.enabled is False
+        post("/rides")
+        assert src.rides is True and src.skill_scheduler.enabled is True
+
+        # KAIA MIX clears paused decks, restores defaults, and explicitly
+        # removes manual lane ownership before the next rendered frame.
+        src.paused.add(1)
+        post("/reset")
+        assert not src.paused
+        assert src.rides is True and src.skill_scheduler.enabled is True
+        assert src.skill_scheduler.snapshot()["manual_overrides"] == []
+        assert src.controls.channels[1]["high"] == pytest.approx(1.0)
+        assert src.controls.state()["xfader_curve"] == "standard"
+        assert src.controls.state()["xfader_assignments"] == {"1": "A", "2": "B"}
+        assert src.controls.state()["xfader"] is None
+    finally:
+        server, D._server = D._server, None
+        if server:
+            server.shutdown()
+
+
+def test_track_change_clears_previous_phrase_actions_before_new_profile_finishes(session):
+    import zlib
+
+    src = session.source
+    phrase = types.SimpleNamespace(
+        start=0.0, end=8.0, aligned=True, bars=4,
+        section="drop_candidate", section_strength=0.9,
+    )
+    profile = types.SimpleNamespace(
+        duration=300.0, aligned=True, phrase_bars=4, phrases=(phrase,),
+    )
+    src.skill_scheduler.set_solo_profile(profile, fingerprint=123)
+    assert src.skill_scheduler.snapshot()["profile_loaded"] is True
+    assert src.skill_scheduler.snapshot()["solo_actions"] == 2
+
+    next_record = rec("next")
+    src.current.record = next_record
+    session._changed(next_record)
+
+    state = src.skill_scheduler.snapshot()
+    assert state["profile_loaded"] is False
+    assert state["solo_actions"] == 0
+    assert src.skill_scheduler.solo_fingerprint == (
+        zlib.crc32(next_record.path.encode("utf-8")) & 0xFFFFFFFF
+    )
+    # The new profile request is queued, but the outgoing record's timeline is
+    # already gone before the worker can read or compile the incoming record.
+    assert session._skill_profile_queue.qsize() == 1
+
+
+def test_master_echo_http_control_changes_real_pcm_and_releases_its_tail(session, monkeypatch):
+    monkeypatch.setattr(D, "_cfg", lambda k, d: 0 if k == "dj_dashboard_port" else d)
+    src = session.source
+    src.rides = False
+    base = D.serve()
+
+    def post(payload):
+        request = urllib.request.Request(
+            base + "fx/echo",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status
+        except urllib.error.HTTPError as error:
+            return error.code
+
+    try:
+        assert post({
+            "action": "on", "beats": 1, "feedback": 0.5, "wet": 0.30,
+        }) == 204
+        state = D.snapshot(session)
+        assert state["fx"]["echo"]["enabled"] is True
+        assert state["fx"]["echo"]["bpm"] == pytest.approx(120.0)
+        assert state["fx"]["echo"]["delay_s"] == pytest.approx(0.5)
+
+        # This fixture is a constant 1000-count signal. At 120 BPM a one-beat
+        # repeat lands on rendered frame 25: dry 1000 + wet (1000 * .30) = 1300.
+        frames = [src.read() for _ in range(26)]
+        assert np.frombuffer(frames[0], np.int16).max() == pytest.approx(1000, abs=2)
+        assert np.frombuffer(frames[25], np.int16).max() == pytest.approx(1300, abs=3)
+
+        assert post({"action": "off"}) == 204
+        tail = D.snapshot(session)["fx"]["echo"]
+        assert tail["enabled"] is False and tail["tail"] is True
+        assert post({"action": "on", "beats": 16, "feedback": 0.5, "wet": 0.3}) == 409
+
+        # Hand-back is an explicit abort path: no wet state survives reset.
+        request = urllib.request.Request(base + "reset", method="POST")
+        with urllib.request.urlopen(request, timeout=5) as response:
+            assert response.status == 204
+        reset = D.snapshot(session)["fx"]["echo"]
+        assert reset["enabled"] is False and reset["tail"] is False
+    finally:
+        server, D._server = D._server, None
+        if server:
+            server.shutdown()
+
+
+def test_live_jog_http_control_updates_the_deck_and_releases_to_neutral(session, monkeypatch):
+    monkeypatch.setattr(D, "_cfg", lambda k, d: 0 if k == "dj_dashboard_port" else d)
+    src = session.source
+    base = D.serve()
+
+    def post(payload):
+        request = urllib.request.Request(
+            base + "bend",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status
+        except urllib.error.HTTPError as error:
+            return error.code
+
+    try:
+        assert post({"slot": 1, "action": "set", "rate": 1.05}) == 204
+        assert src.current.bend["active"] is True
+        assert src.current.bend["target"] == pytest.approx(1.05)
+        # Dashboard tempo reports the applied sample rate, after the eight-frame ramp.
+        for _ in range(R.PITCH_BEND_RAMP_FRAMES + 1):
+            src.read()
+        state = D.snapshot(session)["decks"]["1"]
+        assert state["bend"]["active"] is True
+        assert state["tempo"] == pytest.approx(126.0)
+        assert state["pitch"] == pytest.approx(5.0)
+
+        assert post({"slot": 1, "action": "set", "rate": 1.081}) == 400
+        assert post({"slot": 1, "action": "set", "rate": True}) == 400
+        assert post({"slot": 1, "action": "set", "rate": float("nan")}) == 400
+        assert post({"slot": 1, "action": "set", "rate": 10 ** 1000}) == 400
+
+        for _ in range(R.PITCH_BEND_RAMP_FRAMES + 5):
+            src.read()
+        assert src.current.bend["rate"] == pytest.approx(1.05)
+
+        assert post({"slot": 1, "action": "release"}) == 204
+        for _ in range(R.PITCH_BEND_RAMP_FRAMES + 1):
+            src.read()
+        assert src.current.bend["active"] is False
+        assert src.current.bend["rate"] == pytest.approx(1.0)
+        assert post({"slot": 1, "action": "release"}) == 204
+    finally:
+        server, D._server = D._server, None
+        if server:
+            server.shutdown()
+            server.server_close()
+
+
+def test_pause_and_kaia_mix_release_an_active_live_jog_bend(session, monkeypatch):
+    monkeypatch.setattr(D, "_cfg", lambda k, d: 0 if k == "dj_dashboard_port" else d)
+    src = session.source
+    base = D.serve()
+
+    def post(path, payload):
+        request = urllib.request.Request(
+            base + path,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status
+        except urllib.error.HTTPError as error:
+            return error.code
+
+    try:
+        assert post("bend", {"slot": 1, "action": "set", "rate": 1.04}) == 204
+        assert src.current.bend_active
+        assert post("pause", {"slot": 1}) == 204
+        assert src.current.bend["target"] == pytest.approx(1.0)
+        assert 1 in src.paused
+
+        assert post("play", {"slot": 1}) == 204
+        for _ in range(R.PITCH_BEND_RAMP_FRAMES + 1):
+            src.read()
+        assert not src.current.bend_active
+        assert post("bend", {"slot": 1, "action": "set", "rate": 0.96}) == 204
+        assert src.current.bend_active
+        assert post("reset", {}) == 204
+        for _ in range(R.PITCH_BEND_RAMP_FRAMES + 1):
+            src.read()
+        assert not src.current.bend_active
+        assert not src.paused
+    finally:
+        server, D._server = D._server, None
+        if server:
+            server.shutdown()
+            server.server_close()
+
+
+def test_booth_elapsed_and_remaining_clocks_use_the_live_jog_rate():
+    page = D.PAGE.read_text(encoding="utf-8")
+    assert "const effectiveRate = ratio * (d && d.playback_rate ? d.playback_rate : (d && d.bend && d.bend.rate ? d.bend.rate : 1));" in page
+    assert "fmt(pos / effectiveRate)" in page
+    assert "const rem = d ? (d.length - pos) / effectiveRate : NaN;" in page
+
+
+
+def test_persistent_pitch_http_control_keeps_program_and_new_pfl_decoder_aligned(session, monkeypatch):
+    monkeypatch.setattr(D, "_cfg", lambda key, default=None: 0 if key == "dj_dashboard_port" else default)
+    src = session.source
+    base = D.serve()
+
+    def post(path, payload):
+        request = urllib.request.Request(
+            base + path,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status
+        except urllib.error.HTTPError as error:
+            return error.code
+
+    stream = None
+    try:
+        # Set the persistent ride before selecting PHONES. The newly created PFL
+        # decoder must inherit the stable rate and catch up through its own ring.
+        assert post("pitch", {"slot": 1, "rate": 1.06}) == 204
+        for _ in range(R.PITCH_BEND_RAMP_FRAMES + 1):
+            src.read()
+        deck = src.current
+        assert deck is not None and deck.pitch_rate == pytest.approx(1.06)
+        assert src.set_headphones(1)
+        head = src._headphones_deck
+        assert head is not None
+        assert head.pitch_rate == pytest.approx(1.06)
+        assert head.playback_rate == pytest.approx(1.06)
+        assert head.at() == pytest.approx(deck.at(), abs=1 / R.FRAMES_PER_S)
+
+        stream = src.attach_headphone_stream()
+        assert stream is not None
+        for _ in range(12):
+            src.read()
+            monitor = stream.get_nowait()
+            assert monitor is not None and len(monitor) == R.FRAME_BYTES
+        assert deck.at() == pytest.approx(head.at(), abs=1 / R.FRAMES_PER_S)
+
+        # A live fader movement updates both program and already-selected PFL.
+        assert post("pitch", {"slot": 1, "rate": 1.03}) == 204
+        for _ in range(R.PITCH_BEND_RAMP_FRAMES + 2):
+            src.read()
+        assert deck.pitch_rate == pytest.approx(1.03)
+        assert head.pitch_rate == pytest.approx(1.03)
+        state = D.snapshot(session)["decks"]["1"]
+        assert state["pitch_control"]["target"] == pytest.approx(1.03)
+        assert state["tempo"] == pytest.approx(123.6)
+        assert state["pitch"] == pytest.approx(3.0)
+        assert post("pitch", {"slot": 1, "rate": 1.081}) == 400
+        assert post("pitch", {"slot": 1, "rate": True}) == 400
+        assert post("pitch", {"slot": 1, "rate": float("nan")}) == 400
+        assert post("pitch", {"slot": 2, "rate": 1.03}) == 409
+
+        assert post("pitch", {"slot": 1, "rate": 1.0}) == 204
+        for _ in range(R.PITCH_BEND_RAMP_FRAMES + 2):
+            src.read()
+        assert deck.pitch_rate == pytest.approx(1.0)
+        assert head.pitch_rate == pytest.approx(1.0)
+    finally:
+        if stream is not None:
+            src.detach_headphone_stream(stream)
+        src.set_headphones(None)
+        server, D._server = D._server, None
+        if server:
+            server.shutdown()
+            server.server_close()
+
+
+def test_dj_booth_stops_background_catalog_and_event_polling():
+    page = Path("assets/dj/index.html").read_text(encoding="utf-8")
+
+    assert "let boothEvents = null, boothReconnect = null;" in page
+    assert "stopBoothEvents();" in page
+    assert "if (setsOn && !document.hidden) loadSets();" in page
+    assert "if (!document.hidden) loadCrate();" in page
+    assert "releaseAllRolls(); releaseAllBends();" in page
